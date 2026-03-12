@@ -29,7 +29,11 @@ A complete pipeline to automatically analyze and convert PDF files (both Text-Ba
 
 3.  **Download Models**:
     *   The project expects the YOLO model weights (e.g., `doclayout_yolo_docstructbench_imgsz1024.pt`) to be in the root directory.
-    *   The script uses `Qwen/Qwen2.5-VL-3B-Instruct` or a local version in `./Qwen2.5-VL` by default.
+    *   **Qwen2.5-VL OCR Model**: The script uses `Qwen/Qwen2.5-VL-3B-Instruct` or a local version in `./Qwen2.5-VL-3B` by default. To download the current model locally, run:
+        ```bash
+        pip install -U "huggingface_hub[cli]"
+        huggingface-cli download Qwen/Qwen2.5-VL-3B-Instruct --local-dir Qwen2.5-VL-3B
+        ```
 
 ## 💻 Usage
 
