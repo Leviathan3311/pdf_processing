@@ -1,0 +1,59 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Virtual Environments
+venv/
+env/
+ENV/
+env.bak/
+venv.bak/
+.venv/
+
+# Environment variables
+.env
+
+# Jupyter Notebook
+.ipynb_checkpoints
+
+# IDE / Editor
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+
+# Logs
+*.log
+
+# Model Weights (DocLayout-YOLO & Qwen)
+*.pt
+*.pth
+*.bin
+*.onnx
+*.safetensors
+Qwen2.5-VL/
+Qwen*/
+models/
+weights/
+
+# Downloaded PDFs / Output docs / Images / Test Outputs
+*.pdf
+*.docx
+*.doc
+*.jpg
+*.jpeg
+*.png
+test_output/
+output/
+yolo_detection_output/
+test_frame_extracted/
+*.txt
+!requirements.txt
+!requirements_win.txt
+
+# Temp files
+tmp/
+temp/

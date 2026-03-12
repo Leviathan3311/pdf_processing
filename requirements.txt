@@ -1,0 +1,28 @@
+--extra-index-url https://download.pytorch.org/whl/cu128
+
+# Core PyTorch and HuggingFace
+torch
+torchvision
+torchaudio
+transformers>=4.45.0
+accelerate>=1.0.0
+huggingface_hub>=0.23.0
+
+# Qwen2.5-VL OCR 
+qwen-vl-utils
+bitsandbytes>=0.43.0  # Optional: For 4-bit and 8-bit quantization (--load_4bit, --load_8bit)
+
+# Document formatting and parsing
+markdown
+htmldocx
+python-docx
+
+# PDF Processing and Image handling
+PyMuPDF>=1.24.0
+pdf2image
+opencv-python>=4.10.0
+Pillow>=10.0.0
+
+# YOLO Detection
+ultralytics>=8.3.0
+doclayout_yolo
