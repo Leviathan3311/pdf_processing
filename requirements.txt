@@ -26,3 +26,27 @@ Pillow>=10.0.0
 # YOLO Detection
 ultralytics>=8.3.0
 doclayout_yolo
+
+# ─────────────────────────────────────────────────────
+# LLM Document Intelligence Pipeline
+# ─────────────────────────────────────────────────────
+
+# LangChain Orchestration
+langchain>=0.3.0
+langchain-community>=0.3.0
+langchain-huggingface>=0.1.0
+
+# Vector Database
+chromadb>=0.5.0
+
+# Embedding (BGE-M3 - best multilingual)
+sentence-transformers>=3.0.0
+FlagEmbedding>=1.2.0
+
+# FastAPI
+fastapi>=0.115.0
+uvicorn[standard]>=0.30.0
+python-multipart>=0.0.9
+
+# PDF to DOCX conversion
+pdf2docx>=0.5.8

@@ -41,12 +41,12 @@ A complete pipeline to automatically analyze and convert PDF files (both Text-Ba
 This script will analyze the PDF and automatically route it to the fastest/best conversion pipeline.
 
 ```bash
-python auto_process_pdf.py path/to/your/file.pdf
+python src/pdf_processing/auto_process_pdf.py path/to/your/file.pdf
 ```
 
 **Advanced Usage with OCR features for Scanned PDFs:**
 ```bash
-python auto_process_pdf.py path/to/your/file.pdf --output path/to/output.docx --enable_ocr --load_4bit
+python src/pdf_processing/auto_process_pdf.py path/to/your/file.pdf --output path/to/output.docx --enable_ocr --load_4bit
 ```
 **Options:**
 *   `--output`, `-o`: Output DOCX file path (Optional).
@@ -63,23 +63,80 @@ python auto_process_pdf.py path/to/your/file.pdf --output path/to/output.docx --
 If you just want to analyze whether a PDF is native text or scanned without converting it.
 
 ```bash
-python check_pdf_type.py path/to/your/file.pdf
+python src/pdf_processing/check_pdf_type.py path/to/your/file.pdf
 ```
 
 ### 🧠 3. Test YOLO Layout Detection Only
 To test bounding box detection and save annotated images to a folder, you can run the YOLO diagnostic script.
 
 ```bash
-python yolo_detect.py path/to/your/file.pdf --output-dir my_tests
+python src/pdf_processing/yolo_detect.py path/to/your/file.pdf --output-dir my_tests
 ```
 
 ## 🏗 Architecture & Code Structure
 
-*   `auto_process_pdf.py`: The main entry point. Decides which pipeline to run based on PDF characteristics.
-*   `check_pdf_type.py`: Script to analyze the text-to-page ratio of a PDF document.
-*   `processs_pdf_to_docs.py`: The Heavyweight Pipeline. Contains the logic for YOLO detection -> Qwen OCR Extraction -> Coordinate Mapping -> DOCX Reconstruction.
-*   `yolo_detect.py`: Diagnostics tool to visually preview the layout bounding boxes found by the YOLO model on your PDFs.
+*   `src/pdf_processing/auto_process_pdf.py`: The main entry point. Decides which pipeline to run based on PDF characteristics.
+*   `src/pdf_processing/check_pdf_type.py`: Script to analyze the text-to-page ratio of a PDF document.
+*   `src/pdf_processing/processs_pdf_to_docs.py`: The Heavyweight Pipeline. Contains the logic for YOLO detection -> Qwen OCR Extraction -> Coordinate Mapping -> DOCX Reconstruction.
+*   `src/pdf_processing/yolo_detect.py`: Diagnostics tool to visually preview the layout bounding boxes found by the YOLO model on your PDFs.
 
 ## 📝 Notes
 *   **Text-Based Mode** focuses on speed and pure text extraction. It preserves text and basic reading order but drops complex layouts.
 *   **Scanned (OCR) Mode** attempts to perfectly rebuild the document page-by-page. It handles multi-column layouts and tables but requires significantly more processing time and hardware.
+
+---
+
+## 🤖 LLM Document Intelligence Pipeline
+
+A LangChain Agent powered by **Qwen3-4B** that can analyze, compare, and modify documents while preserving original formatting.
+
+### Features
+*   **Q&A**: Ask questions about uploaded documents (RAG with ChromaDB + BGE-M3)
+*   **Compare**: Upload 2 documents and get a detailed comparison
+*   **Edit**: Request content modifications — LLM generates changes, applies them to the original `.docx` preserving format
+
+### Architecture
+```
+POST /chat → LangChain Agent (Qwen3-4B) → Auto-routes to:
+  ├── chat_tool   → RAG search → answer / summarize
+  ├── compare_tool → load 2 docs → diff
+  └── edit_tool   → JSON modifications → doc surgery → revised .docx
+```
+
+### Setup
+
+1.  **Install new dependencies**:
+    ```bash
+    pip install -r requirements.txt
+    ```
+
+2.  **Download Qwen3-4B model** (~8GB):
+    ```bash
+    huggingface-cli download Qwen/Qwen3-4B --local-dir Qwen3-4B
+    ```
+
+3.  **Start the API**:
+    ```bash
+    uvicorn api.main:app --host 0.0.0.0 --port 8000
+    ```
+    API docs: http://localhost:8000/docs
+
+### API Endpoints
+
+| Method | Endpoint | Description |
+|--------|----------|-------------|
+| POST | `/documents/upload` | Upload Word/PDF |
+| GET | `/documents/` | List documents |
+| DELETE | `/documents/{doc_id}` | Delete document |
+| POST | `/chat` | Unified chat (Q&A, compare, edit) |
+| GET | `/download/{filename}` | Download revised files |
+| GET | `/health` | Health check |
+
+### Code Structure
+*   `src/llm_pipeline/document_parser.py`: Parse Word/PDF → structured elements with IDs
+*   `src/llm_pipeline/vector_store.py`: ChromaDB + BGE-M3 embedding management
+*   `src/llm_pipeline/llm_engine.py`: Load Qwen3-4B + LangChain Agent
+*   `src/llm_pipeline/tools.py`: 3 LangChain Tools (chat, compare, edit)
+*   `src/llm_pipeline/doc_surgery.py`: Apply JSON modifications to .docx preserving format
+*   `api/main.py`: FastAPI entry point
+*   `api/routes/`: API route handlers

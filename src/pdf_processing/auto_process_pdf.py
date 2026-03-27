@@ -2,6 +2,11 @@ import sys
 import argparse
 from pathlib import Path
 
+# Add the 'src' directory to sys.path to allow running as script directly
+src_path = str(Path(__file__).resolve().parent.parent)
+if src_path not in sys.path:
+    sys.path.insert(0, src_path)
+
 try:
     import fitz  # PyMuPDF
 except ImportError:
@@ -13,9 +18,9 @@ from docx.shared import Pt, Cm
 
 # Import The existing processing pipeline for scanned PDFs
 try:
-    from processs_pdf_to_docs import process_pdf_to_docx
+    from pdf_processing.processs_pdf_to_docs import process_pdf_to_docx
 except ImportError:
-    print("Warning: Could not import process_pdf_to_docx from processs_pdf_to_docs.py")
+    print("Warning: Could not import process_pdf_to_docx from pdf_processing.processs_pdf_to_docs")
     process_pdf_to_docx = None
 
 def analyze_pdf(pdf_path: Path):

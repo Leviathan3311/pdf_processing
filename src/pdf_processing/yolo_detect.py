@@ -170,9 +170,11 @@ def print_detection_summary(detections: dict, page_num: int):
 
 
 def main():
+    root_dir = Path(__file__).resolve().parent.parent.parent
+    default_model = str(root_dir / 'doclayout_yolo_docstructbench_imgsz1024.pt')
     parser = argparse.ArgumentParser(description='Detect bounding boxes in PDF using DocLayout YOLO')
     parser.add_argument('pdf_path', type=str, help='Path to PDF file')
-    parser.add_argument('--model', type=str, default='doclayout_yolo_docstructbench_imgsz1024.pt',
+    parser.add_argument('--model', type=str, default=default_model,
                         help='Path to YOLO model file')
     parser.add_argument('--output-dir', type=str, default='yolo_detection_output',
                         help='Output directory for annotated images')

@@ -55,3 +55,8 @@ test_frame_extracted/
 # Temp files
 tmp/
 temp/
+
+# LLM Pipeline
+chroma_db/
+uploads/
+outputs/

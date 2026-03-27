@@ -8,11 +8,16 @@ import re
 from pathlib import Path
 from docx import Document
 from docx.shared import Pt, Cm
+
+# Add the 'src' directory to sys.path to allow running as script directly
+src_path = str(Path(__file__).resolve().parent.parent)
+if src_path not in sys.path:
+    sys.path.insert(0, src_path)
 from docx.enum.text import WD_ALIGN_PARAGRAPH, WD_BREAK
 from docx.oxml import OxmlElement
 from docx.oxml.ns import qn
 
-from yolo_detect import (
+from pdf_processing.yolo_detect import (
     pdf_to_images, detect_bboxes, 
     crop_bbox
 )
@@ -165,7 +170,7 @@ def process_pdf_to_docx(
     """Complete pipeline: PDF → Single DOCX"""
 
     # Resolve script directory so model paths work regardless of cwd (e.g. when run from api/scripts)
-    _root = Path(__file__).resolve().parent
+    _root = Path(__file__).resolve().parent.parent.parent
     if model_path is None:
         model_path = str(_root / "doclayout_yolo_docstructbench_imgsz1024.pt")
     else:
