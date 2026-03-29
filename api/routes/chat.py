@@ -69,7 +69,7 @@ Yêu cầu của người dùng: {request.message}"""
 
         # Run the robust custom agent loop
         all_tools = tools.get_all_tools()
-        result = llm_engine.run_agent(enhanced_input, tools=all_tools, max_steps=4)
+        result = llm_engine.run_agent(enhanced_input, tools=all_tools, max_steps=4, session_id=request.session_id, raw_user_message=request.message)
         
         response_text = result.get("output", "Không có kết quả.")
         generated_files = result.get("files", [])

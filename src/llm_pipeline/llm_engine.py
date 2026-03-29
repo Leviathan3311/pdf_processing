@@ -19,6 +19,7 @@ _model = None
 _tokenizer = None
 _langchain_llm = None
 _agent_executor = None
+_session_histories = {}
 
 
 SYSTEM_PROMPT = """Bạn là trợ lý thông minh chuyên xử lý tài liệu. Bạn có thể:
@@ -104,6 +105,10 @@ def load_model(
         print("[LLM Engine] Using float16 (no quantization)")
     
     _tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
+    _tokenizer.padding_side = "left"  # Required for batched generation
+    if _tokenizer.pad_token is None:
+        _tokenizer.pad_token = _tokenizer.eos_token
+        
     _model = AutoModelForCausalLM.from_pretrained(model_path, **model_kwargs)
     
     print("[LLM Engine] ✓ Model loaded successfully")
@@ -136,7 +141,7 @@ def get_langchain_llm(model_path: str = None, load_4bit: bool = True, load_8bit:
     return _langchain_llm
 
 
-def run_agent(query: str, tools: list, max_steps: int = 3) -> dict:
+def run_agent(query: str, tools: list, max_steps: int = 3, session_id: str = "default", raw_user_message: str = None) -> dict:
     """
     Native Qwen3 tool-calling loop.
     Bypasses LangGraph to ensure 100% accurate tool-call parsing with local HF models.
@@ -169,14 +174,22 @@ CHÚ Ý QUAN TRỌNG: KIẾN THỨC VÀ NỘI DUNG TÀI LIỆU KHÔNG ĐƯỢC C
 Bạn BẮT BUỘC phải gọi công cụ (tool) tương ứng để tìm thông tin trước khi trả lời.
 - Dùng `chat_tool` để hỏi về nội dung, tóm tắt.
 - Dùng `compare_tool` để so sánh 2 tài liệu.
-- Dùng `edit_tool` để chỉnh sửa tài liệu.
+- Dùng `edit_tool` để chỉnh sửa ĐIỂM NHỎ trong tài liệu.
+- Dùng `batch_rewrite_tool` khi người dùng yêu cầu viết lại TOÀN BỘ tài liệu/file mẫu. Quan trọng: Trích xuất kết quả tổng hợp/thông tin từ lịch sử và TRUYỀN toàn bộ vào tham số `context` của tool này.
 
 Luôn trả lời bằng tiếng Việt rõ ràng, ngắn gọn."""
 
-    messages = [
-        {"role": "system", "content": system_prompt},
-        {"role": "user", "content": query}
-    ]
+    global _session_histories
+    if session_id not in _session_histories:
+        _session_histories[session_id] = []
+
+    messages = [{"role": "system", "content": system_prompt}]
+    
+    # Append the last N history messages to prevent context overflow (e.g. max 10 turns)
+    messages.extend(_session_histories[session_id][-20:])
+    
+    # Append the current augmented query
+    messages.append({"role": "user", "content": query})
     
     from pathlib import Path
     generated_files = []
@@ -238,10 +251,18 @@ Luôn trả lời bằng tiếng Việt rõ ràng, ngắn gọn."""
         # If no tool tag is found, this is the final answer
         break
         
+    final_output = messages[-1]["content"]
+    
+    # Save the interaction to session history
+    # Save the raw user message if provided to prevent history length explosion, otherwise save query
+    user_msg_to_save = raw_user_message if raw_user_message else query
+    _session_histories[session_id].append({"role": "user", "content": user_msg_to_save})
+    _session_histories[session_id].append({"role": "assistant", "content": final_output})
+    
     torch.cuda.empty_cache()
     
     return {
-        "output": messages[-1]["content"],
+        "output": final_output,
         "files": generated_files
     }
 
@@ -282,6 +303,49 @@ def generate_raw(prompt: str, max_new_tokens: int = 4096) -> str:
     
     torch.cuda.empty_cache()
     return response.strip()
+
+
+def generate_raw_batch(prompts: list[str], max_new_tokens: int = 4096) -> list[str]:
+    """
+    Direct batched generation (for parallel structure outputs like JSON across chunks).
+    Speeds up repetitive document surgery immensely.
+    """
+    model, tokenizer = load_model()
+    
+    texts = []
+    for prompt in prompts:
+        messages = [
+            {"role": "system", "content": "Bạn là trợ lý AI chuyên xử lý tài liệu. Luôn trả lời chính xác theo format JSON yêu cầu."},
+            {"role": "user", "content": prompt},
+        ]
+        text = tokenizer.apply_chat_template(
+            messages,
+            tokenize=False,
+            add_generation_prompt=True,
+            enable_thinking=False,
+        )
+        texts.append(text)
+        
+    inputs = tokenizer(texts, return_tensors="pt", padding=True).to(model.device)
+    
+    with torch.no_grad():
+        generated_ids = model.generate(
+            **inputs,
+            max_new_tokens=max_new_tokens,
+            temperature=0.3,
+            top_p=0.9,
+            repetition_penalty=1.1,
+            do_sample=True,
+        )
+    
+    responses = []
+    for i in range(len(prompts)):
+        generated_ids_trimmed = generated_ids[i][inputs.input_ids.shape[-1]:]
+        resp = tokenizer.decode(generated_ids_trimmed, skip_special_tokens=True)
+        responses.append(resp.strip())
+        
+    torch.cuda.empty_cache()
+    return responses
 
 
 def cleanup():

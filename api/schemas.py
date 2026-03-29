@@ -57,6 +57,7 @@ class DeleteResponse(BaseModel):
 class ChatRequest(BaseModel):
     """Request body for the unified /chat endpoint."""
     message: str = Field(..., description="User message (Q&A, compare, edit, summarize...)")
+    session_id: str = Field(default="default", description="Session ID to track chat history per tab/user")
     doc_ids: list[str] = Field(default=[], description="List of doc_ids to use as context. Empty = use all.")
 
 
