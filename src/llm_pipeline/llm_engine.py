@@ -22,6 +22,15 @@ _agent_executor = None
 _session_histories = {}
 
 
+def _safe_cuda_cleanup():
+    """Safely clean CUDA cache, ignoring errors from corrupted CUDA state."""
+    try:
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+    except Exception as e:
+        print(f"[LLM Engine] ⚠️ CUDA cleanup warning (non-fatal): {e}")
+
+
 SYSTEM_PROMPT = """Bạn là trợ lý thông minh chuyên xử lý tài liệu. Bạn có thể:
 1. Trả lời câu hỏi về nội dung tài liệu đã upload
 2. So sánh hai tài liệu và liệt kê điểm khác biệt
@@ -172,10 +181,18 @@ def run_agent(query: str, tools: list, max_steps: int = 3, session_id: str = "de
     system_prompt = """Bạn là trợ lý xử lý tài liệu thông minh.
 CHÚ Ý QUAN TRỌNG: KIẾN THỨC VÀ NỘI DUNG TÀI LIỆU KHÔNG ĐƯỢC CUNG CẤP TRONG PROMPT NÀY.
 Bạn BẮT BUỘC phải gọi công cụ (tool) tương ứng để tìm thông tin trước khi trả lời.
-- Dùng `chat_tool` để hỏi về nội dung, tóm tắt.
+- Dùng `chat_tool` để hỏi về nội dung, tóm tắt, lập bảng thống kê, trích xuất thông tin.
 - Dùng `compare_tool` để so sánh 2 tài liệu.
 - Dùng `edit_tool` để chỉnh sửa ĐIỂM NHỎ trong tài liệu.
 - Dùng `batch_rewrite_tool` khi người dùng yêu cầu viết lại TOÀN BỘ tài liệu/file mẫu. Quan trọng: Trích xuất kết quả tổng hợp/thông tin từ lịch sử và TRUYỀN toàn bộ vào tham số `context` của tool này.
+
+QUY TẮC BẮT BUỘC:
+1. Khi có tin nhắn thông báo "[Tài liệu đã tải lên:...]":
+   - NẾU trước đó đã có yêu cầu xử lý (VD: "tóm tắt", "dịch") → bạn phải tự động gọi tool thực hiện yêu cầu đó ngay lập tức.
+   - NẾU trước đó chưa có yêu cầu nào → hãy chào và hỏi người dùng xem họ muốn làm gì với tài liệu vừa tải lên.
+2. NẾU người dùng yêu cầu thao tác trên tài liệu nhưng danh sách "Tài liệu hiện có" đang là "Chưa có tài liệu nào." → Hãy báo lỗi thân thiện rằng bạn chưa nhận được tài liệu nào và cần họ tải lên trước.
+
+Khi trả lời dạng bảng thống kê, hãy sử dụng format bảng Markdown (dùng | và ---) để hiển thị dữ liệu rõ ràng.
 
 Luôn trả lời bằng tiếng Việt rõ ràng, ngắn gọn."""
 
@@ -196,24 +213,40 @@ Luôn trả lời bằng tiếng Việt rõ ràng, ngắn gọn."""
     
     # Run the loop
     for step in range(max_steps):
-        text = tokenizer.apply_chat_template(
-            messages,
-            tools=hf_tools,
-            tokenize=False,
-            add_generation_prompt=True,
-            enable_thinking=False,  # Fast mode: skip chain-of-thought
-        )
-        
-        inputs = tokenizer([text], return_tensors="pt").to(model.device)
-        with torch.no_grad():
-            generated_ids = model.generate(
-                **inputs,
-                max_new_tokens=4096,
-                temperature=0.1,  # Low temp for accurate tool formatting
-                do_sample=True,
+        try:
+            text = tokenizer.apply_chat_template(
+                messages,
+                tools=hf_tools,
+                tokenize=False,
+                add_generation_prompt=True,
+                enable_thinking=False,  # Fast mode: skip chain-of-thought
             )
             
-        response_text = tokenizer.decode(generated_ids[0][inputs.input_ids.shape[-1]:], skip_special_tokens=True)
+            inputs = tokenizer([text], return_tensors="pt").to(model.device)
+            input_len = inputs.input_ids.shape[-1]
+            with torch.no_grad():
+                generated_ids = model.generate(
+                    **inputs,
+                    max_new_tokens=4096,
+                    temperature=0.1,  # Low temp for accurate tool formatting
+                    do_sample=True,
+                )
+            
+            # Free input tensors immediately
+            del inputs
+            _safe_cuda_cleanup()
+                
+            response_text = tokenizer.decode(generated_ids[0][input_len:], skip_special_tokens=True)
+            
+            # Free generated tensors
+            del generated_ids
+            
+        except (RuntimeError, torch.cuda.CudaError) as cuda_err:
+            print(f"[Agent Error] CUDA error during generation: {cuda_err}")
+            _safe_cuda_cleanup()
+            messages.append({"role": "assistant", "content": "Lỗi GPU khi xử lý. Vui lòng thử lại."})
+            break
+        
         messages.append({"role": "assistant", "content": response_text})
         
         # Parse Qwen native <tool_call>...
@@ -232,7 +265,7 @@ Luôn trả lời bằng tiếng Việt rõ ràng, ngắn gọn."""
                     
                     # Track files
                     if "_Revised.docx" in tool_result:
-                        m = re.search(r'[\w\-./\\]+_Revised\.docx', tool_result)
+                        m = re.search(r'[\w\-./\\, ]+_Revised\.docx', tool_result)
                         if m:
                             generated_files.append(Path(m.group()).name)
                             
@@ -259,7 +292,7 @@ Luôn trả lời bằng tiếng Việt rõ ràng, ngắn gọn."""
     _session_histories[session_id].append({"role": "user", "content": user_msg_to_save})
     _session_histories[session_id].append({"role": "assistant", "content": final_output})
     
-    torch.cuda.empty_cache()
+    _safe_cuda_cleanup()
     
     return {
         "output": final_output,
@@ -301,7 +334,7 @@ def generate_raw(prompt: str, max_new_tokens: int = 4096) -> str:
     generated_ids_trimmed = generated_ids[0][inputs.input_ids.shape[-1]:]
     response = tokenizer.decode(generated_ids_trimmed, skip_special_tokens=True)
     
-    torch.cuda.empty_cache()
+    _safe_cuda_cleanup()
     return response.strip()
 
 
@@ -344,7 +377,7 @@ def generate_raw_batch(prompts: list[str], max_new_tokens: int = 4096) -> list[s
         resp = tokenizer.decode(generated_ids_trimmed, skip_special_tokens=True)
         responses.append(resp.strip())
         
-    torch.cuda.empty_cache()
+    _safe_cuda_cleanup()
     return responses
 
 
@@ -359,5 +392,5 @@ def cleanup():
         del _tokenizer
         _tokenizer = None
     
-    torch.cuda.empty_cache()
+    _safe_cuda_cleanup()
     print("[LLM Engine] ✓ GPU memory cleaned up")

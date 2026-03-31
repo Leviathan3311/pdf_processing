@@ -7,6 +7,7 @@ LangChain Tools - 3 tools for the Agent.
 """
 import json
 from typing import Optional
+import contextvars
 
 from langchain_core.tools import tool
 
@@ -14,6 +15,8 @@ from llm_pipeline import vector_store
 from llm_pipeline import llm_engine
 from llm_pipeline import doc_surgery
 
+# Context variable to hold doc_ids for the current API request
+current_request_doc_ids = contextvars.ContextVar("current_request_doc_ids", default=None)
 
 # ─────────────────────────────────────────────────────────────
 # Store for document metadata (doc_id → file_name, docx_path)
@@ -50,9 +53,12 @@ def chat_tool(query: str) -> str:
     Dùng tool này khi người dùng hỏi về nội dung, yêu cầu tóm tắt, 
     hoặc cần thông tin từ tài liệu. Input là câu hỏi của người dùng."""
     
-    doc_ids = get_all_doc_ids()
+    # Priority: doc_ids from current request > all registered doc_ids
+    req_docs = current_request_doc_ids.get()
+    doc_ids = req_docs if req_docs is not None else get_all_doc_ids()
+    
     if not doc_ids:
-        return "Chưa có tài liệu nào được upload. Vui lòng upload tài liệu trước."
+        return "Chưa có tài liệu nào được chỉ định để trả lời câu hỏi. Vui lòng kiểm tra lại tải lên."
     
     # RAG: search relevant chunks
     # Giảm top_k xuống 7 (thay vì 15) để giảm lượng context đưa vào LLM, giúp mô hình xử lý nhanh hơn nhiều
@@ -96,11 +102,13 @@ def compare_tool(input_text: str) -> str:
     Dùng tool này khi người dùng yêu cầu so sánh, đối chiếu hai file.
     Input là yêu cầu so sánh của người dùng (ví dụ: 'so sánh giá giữa 2 file')."""
     
-    doc_ids = get_all_doc_ids()
-    if len(doc_ids) < 2:
-        return "Cần ít nhất 2 tài liệu để so sánh. Vui lòng upload thêm tài liệu."
+    req_docs = current_request_doc_ids.get()
+    doc_ids = req_docs if req_docs is not None else get_all_doc_ids()
     
-    # Get full content of the two most recent documents
+    if len(doc_ids) < 2:
+        return "Cần ít nhất 2 tài liệu để so sánh. Vui lòng kiểm tra lại tải lên."
+    
+    # Get full content of the two most recent documents in the scoped context
     doc1_id = doc_ids[-2]
     doc2_id = doc_ids[-1]
     
@@ -146,11 +154,13 @@ def edit_tool(instruction: str) -> str:
     (ví dụ: 'sửa giá thành 50 triệu', 'đổi tên công ty thành ABC').
     Input là yêu cầu sửa đổi cụ thể."""
     
-    doc_ids = get_all_doc_ids()
-    if not doc_ids:
-        return "Chưa có tài liệu nào được upload. Vui lòng upload tài liệu trước."
+    req_docs = current_request_doc_ids.get()
+    doc_ids = req_docs if req_docs is not None else get_all_doc_ids()
     
-    # Use the most recently uploaded document
+    if not doc_ids:
+        return "Chưa có tài liệu nào được chỉ định để sửa đổi. Vui lòng kiểm tra lại tải lên."
+    
+    # Use the most recently uploaded document in the scoped context
     doc_id = doc_ids[-1]
     doc_info = get_doc_info(doc_id)
     
@@ -243,11 +253,13 @@ def batch_rewrite_tool(instruction: str, context: str) -> str:
     Tham số `context` CẦN chứa toàn bộ thông tin/tổng hợp mà bạn muốn dùng để viết lại.
     Tham số `instruction` là yêu cầu cụ thể (vd: 'Viết lại hợp đồng theo format')."""
     
-    doc_ids = get_all_doc_ids()
-    if not doc_ids:
-        return "Chưa có tài liệu nào được upload. Vui lòng upload tài liệu trước."
+    req_docs = current_request_doc_ids.get()
+    doc_ids = req_docs if req_docs is not None else get_all_doc_ids()
     
-    # Lấy tài liệu mới nhất (chính là template format)
+    if not doc_ids:
+        return "Chưa có tài liệu nào được chỉ định để sửa đổi toàn bộ. Vui lòng kiểm tra lại tải lên."
+    
+    # Lấy tài liệu mới nhất (chính là template format) trong scoped context
     doc_id = doc_ids[-1]
     doc_info = get_doc_info(doc_id)
     if not doc_info:

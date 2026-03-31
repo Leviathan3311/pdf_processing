@@ -7,6 +7,7 @@ summarize, edit) and routes to the appropriate tool.
 import re
 from pathlib import Path
 from fastapi import APIRouter, HTTPException
+from fastapi.concurrency import run_in_threadpool
 
 import sys
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent / "src"))
@@ -52,7 +53,10 @@ async def chat(request: ChatRequest):
     try:
         # Build context info for the agent
         available_docs = []
-        doc_ids_to_use = request.doc_ids if request.doc_ids else tools.get_all_doc_ids()
+        doc_ids_to_use = request.doc_ids  # Only use explicitly provided docs for session isolation
+        
+        # Scope the tools to the current request doc_ids
+        tools.current_request_doc_ids.set(doc_ids_to_use)
         
         for doc_id in doc_ids_to_use:
             info = tools.get_doc_info(doc_id)
@@ -61,15 +65,26 @@ async def chat(request: ChatRequest):
         
         docs_context = "\n".join(available_docs) if available_docs else "Chưa có tài liệu nào."
         
+        system_reminder = ""
+        if not available_docs and not request.message.strip().startswith("[Tài liệu"):
+            system_reminder = "\n\n[HỆ THỐNG CẢNH BÁO AI: Hiện chưa có tài liệu nào được cung cấp. Bạn BẮT BUỘC phải thông báo cho người dùng biết lỗi này và yêu cầu tải tài liệu lên.]"
+            
         # Enhance the user message with context about available documents
         enhanced_input = f"""Tài liệu hiện có:
 {docs_context}
 
-Yêu cầu của người dùng: {request.message}"""
+Yêu cầu của người dùng: {request.message}{system_reminder}"""
 
-        # Run the robust custom agent loop
+        # Run the robust custom agent loop in a threadpool to avoid blocking Event Loop
         all_tools = tools.get_all_tools()
-        result = llm_engine.run_agent(enhanced_input, tools=all_tools, max_steps=4, session_id=request.session_id, raw_user_message=request.message)
+        result = await run_in_threadpool(
+            llm_engine.run_agent,
+            enhanced_input, 
+            tools=all_tools, 
+            max_steps=4, 
+            session_id=request.session_id, 
+            raw_user_message=request.message
+        )
         
         response_text = result.get("output", "Không có kết quả.")
         generated_files = result.get("files", [])

@@ -10,6 +10,7 @@ from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
 from fastapi.responses import FileResponse, JSONResponse
+from fastapi.staticfiles import StaticFiles
 from fastapi.middleware.cors import CORSMiddleware
 
 # Add src to path for imports
@@ -102,6 +103,15 @@ app.add_middleware(
 # Include routers
 app.include_router(documents.router)
 app.include_router(chat.router)
+
+# Serve chatbot UI
+@app.get("/chatbot")
+async def chatbot_page():
+    """Serve the chatbot UI page."""
+    return FileResponse(str(ROOT_DIR / "chatbot.html"))
+
+# Mount static files (CSS, JS, images) from project root
+app.mount("/static", StaticFiles(directory=str(ROOT_DIR)), name="static")
 
 
 @app.get("/health", response_model=HealthResponse)

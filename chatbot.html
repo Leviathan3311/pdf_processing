@@ -1,0 +1,208 @@
+<!DOCTYPE html>
+<html lang="vi">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <meta name="description" content="Trợ lý Chatbot AI - Học viện Kỹ thuật và Công nghệ An ninh">
+    <title>Trợ lý AI - Học viện Kỹ thuật và Công nghệ An ninh</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Be+Vietnam+Pro:wght@300;400;500;600;700&display=swap" rel="stylesheet">
+    <!-- Marked.js for markdown rendering -->
+    <script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
+    <!-- highlight.js for code blocks -->
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/styles/github-dark.min.css">
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/highlight.min.js"></script>
+    <!-- SheetJS for Excel export -->
+    <script src="https://cdn.sheetjs.com/xlsx-0.20.3/package/dist/xlsx.full.min.js"></script>
+    <link rel="stylesheet" href="/static/chatbot.css">
+</head>
+<body>
+    <div class="app-container">
+        <!-- ═══════════════════════════════════════════ -->
+        <!-- SIDEBAR                                     -->
+        <!-- ═══════════════════════════════════════════ -->
+        <aside class="sidebar" id="sidebar">
+            <div class="sidebar-header">
+                <div class="logo-section">
+                    <img src="/static/Logo_H%E1%BB%8Dc_vi%E1%BB%87n_K%E1%BB%B9_thu%E1%BA%ADt_v%C3%A0_C%C3%B4ng_ngh%E1%BB%87_An_ninh_n%C4%83m_2025.png" 
+                         alt="Logo Học viện" class="logo-img" id="logo-img">
+                    <div class="logo-text">
+                        <span class="logo-title">HỌC VIỆN KTCNAN</span>
+                        <span class="logo-subtitle">Trợ lý AI</span>
+                    </div>
+                </div>
+                <button class="btn-icon sidebar-toggle-btn" id="sidebar-collapse-btn" title="Thu gọn sidebar">
+                    <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                        <path d="M11 19l-7-7 7-7M18 19l-7-7 7-7"/>
+                    </svg>
+                </button>
+            </div>
+
+            <!-- New Chat Button -->
+            <button class="new-chat-btn" id="new-chat-btn">
+                <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                    <line x1="12" y1="5" x2="12" y2="19"></line>
+                    <line x1="5" y1="12" x2="19" y2="12"></line>
+                </svg>
+                <span>Cuộc hội thoại mới</span>
+            </button>
+
+            <!-- Search Box -->
+            <div class="search-container">
+                <div class="search-input-wrapper">
+                    <svg class="search-icon" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                        <circle cx="11" cy="11" r="8"></circle>
+                        <line x1="21" y1="21" x2="16.65" y2="16.65"></line>
+                    </svg>
+                    <input type="text" class="search-input" id="search-input" 
+                           placeholder="Tìm kiếm hội thoại..." autocomplete="off">
+                    <button class="search-clear-btn" id="search-clear-btn" style="display:none" title="Xóa tìm kiếm">
+                        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                            <line x1="18" y1="6" x2="6" y2="18"></line>
+                            <line x1="6" y1="6" x2="18" y2="18"></line>
+                        </svg>
+                    </button>
+                </div>
+                <!-- Search Results Dropdown -->
+                <div class="search-results" id="search-results" style="display:none"></div>
+            </div>
+
+            <!-- Conversation List -->
+            <div class="conversation-list" id="conversation-list">
+                <!-- Dynamically populated -->
+            </div>
+
+            <!-- Sidebar Footer -->
+            <div class="sidebar-footer">
+                <div class="sidebar-footer-text">
+                    © 2026 Học viện KTCNAN
+                </div>
+            </div>
+        </aside>
+
+        <!-- Sidebar Overlay (mobile) -->
+        <div class="sidebar-overlay" id="sidebar-overlay"></div>
+
+        <!-- ═══════════════════════════════════════════ -->
+        <!-- MAIN CONTENT                                -->
+        <!-- ═══════════════════════════════════════════ -->
+        <main class="main-content" id="main-content">
+            <!-- Top Bar -->
+            <header class="top-bar">
+                <button class="btn-icon sidebar-open-btn" id="sidebar-open-btn" title="Mở sidebar">
+                    <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                        <line x1="3" y1="6" x2="21" y2="6"></line>
+                        <line x1="3" y1="12" x2="21" y2="12"></line>
+                        <line x1="3" y1="18" x2="21" y2="18"></line>
+                    </svg>
+                </button>
+                <div class="conversation-title" id="conversation-title">Cuộc hội thoại mới</div>
+                <div class="top-bar-actions">
+                    <div class="doc-count-badge" id="doc-count-badge" style="display:none">
+                        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                            <path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/>
+                            <polyline points="14 2 14 8 20 8"/>
+                        </svg>
+                        <span id="doc-count-text">0 files</span>
+                    </div>
+                </div>
+            </header>
+
+            <!-- Chat Messages Area -->
+            <div class="chat-area" id="chat-area">
+                <!-- Welcome Screen -->
+                <div class="welcome-screen" id="welcome-screen">
+                    <div class="welcome-logo-glow">
+                        <img src="/static/Logo_H%E1%BB%8Dc_vi%E1%BB%87n_K%E1%BB%B9_thu%E1%BA%ADt_v%C3%A0_C%C3%B4ng_ngh%E1%BB%87_An_ninh_n%C4%83m_2025.png" 
+                             alt="Logo" class="welcome-logo">
+                    </div>
+                    <h1 class="welcome-title">Trợ lý AI Văn bản</h1>
+                    <p class="welcome-subtitle">Học viện Kỹ thuật và Công nghệ An ninh</p>
+                    <p class="welcome-desc">Tải lên tài liệu Word, PDF và đặt câu hỏi. Tôi sẽ phân tích, tóm tắt, so sánh và chỉnh sửa nội dung cho bạn.</p>
+                    <div class="welcome-suggestions">
+                        <button class="suggestion-chip" data-prompt="Tóm tắt nội dung tài liệu đã tải lên">
+                            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                                <path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/>
+                                <polyline points="14 2 14 8 20 8"/>
+                                <line x1="16" y1="13" x2="8" y2="13"/>
+                                <line x1="16" y1="17" x2="8" y2="17"/>
+                            </svg>
+                            Tóm tắt tài liệu
+                        </button>
+                        <button class="suggestion-chip" data-prompt="So sánh nội dung giữa các tài liệu">
+                            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                                <rect x="2" y="4" width="8" height="16" rx="1"/>
+                                <rect x="14" y="4" width="8" height="16" rx="1"/>
+                            </svg>
+                            So sánh tài liệu
+                        </button>
+                        <button class="suggestion-chip" data-prompt="Trích xuất thông tin quan trọng từ tài liệu">
+                            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                                <circle cx="11" cy="11" r="8"/>
+                                <line x1="21" y1="21" x2="16.65" y2="16.65"/>
+                            </svg>
+                            Trích xuất thông tin
+                        </button>
+                    </div>
+                </div>
+
+                <!-- Messages Container -->
+                <div class="messages-container" id="messages-container" style="display:none">
+                    <!-- Messages inserted dynamically -->
+                </div>
+            </div>
+
+        <!-- Input Area -->
+        <div class="input-area">
+            <div class="input-wrapper" id="input-wrapper">
+                <!-- File Attachments Preview -->
+                <div class="attachments-bar" id="attachments-bar" style="display:none">
+                    <div class="attachments-list" id="attachments-list">
+                        <!-- File chips inserted dynamically -->
+                    </div>
+                </div>
+
+                <div class="input-container">
+                    <button class="btn-icon attach-btn" id="attach-btn" title="Đính kèm tài liệu (.docx, .pdf)">
+                        <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                            <path d="M21.44 11.05l-9.19 9.19a6 6 0 0 1-8.49-8.49l9.19-9.19a4 4 0 0 1 5.66 5.66l-9.2 9.19a2 2 0 0 1-2.83-2.83l8.49-8.49"/>
+                        </svg>
+                    </button>
+                    <textarea class="chat-input" id="chat-input" 
+                              placeholder="Nhập tin nhắn..." 
+                              rows="1"></textarea>
+                    <button class="send-btn" id="send-btn" title="Gửi tin nhắn" disabled>
+                        <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                            <line x1="22" y1="2" x2="11" y2="13"></line>
+                            <polygon points="22 2 15 22 11 13 2 9 22 2"></polygon>
+                        </svg>
+                    </button>
+                </div>
+            </div>
+            <input type="file" id="file-input" multiple accept=".docx,.pdf,.doc" style="display:none">
+        </div>
+        </main>
+    </div>
+
+    <!-- Context Menu -->
+    <div class="context-menu" id="context-menu" style="display:none">
+        <button class="context-menu-item" id="ctx-rename">
+            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                <path d="M11 4H4a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2v-7"/>
+                <path d="M18.5 2.5a2.121 2.121 0 0 1 3 3L12 15l-4 1 1-4 9.5-9.5z"/>
+            </svg>
+            Đổi tên
+        </button>
+        <button class="context-menu-item ctx-delete" id="ctx-delete">
+            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                <polyline points="3 6 5 6 21 6"/>
+                <path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"/>
+            </svg>
+            Xóa
+        </button>
+    </div>
+
+    <script src="/static/chatbot.js?v=4"></script>
+</body>
+</html>
