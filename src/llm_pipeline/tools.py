@@ -60,23 +60,63 @@ def chat_tool(query: str) -> str:
     if not doc_ids:
         return "Chưa có tài liệu nào được chỉ định để trả lời câu hỏi. Vui lòng kiểm tra lại tải lên."
     
-    # RAG: search relevant chunks
-    # Giảm top_k xuống 7 (thay vì 15) để giảm lượng context đưa vào LLM, giúp mô hình xử lý nhanh hơn nhiều
-    results = vector_store.search(query, doc_ids=doc_ids, top_k=7)
-    
-    if not results:
-        return "Không tìm thấy thông tin liên quan trong tài liệu."
-    
-    # Build context
     context_parts = []
-    for r in results:
-        meta = r.get("metadata", {})
-        file_name = meta.get("file_name", "unknown")
-        element_id = meta.get("element_id", "?")
-        content = r.get("content", "")
-        context_parts.append(f"[{file_name} - {element_id}] {content}")
     
-    context = "\n".join(context_parts)
+    # First, try to fetch the FULL text for all selected documents
+    # to avoid context fragmentation (especially useful for tables/statistics across multiple files).
+    full_text_mode = True
+    all_texts = []
+    total_length = 0
+    
+    for doc_id in doc_ids:
+        doc_info = get_doc_info(doc_id)
+        if not doc_info:
+            continue
+        
+        file_name = doc_info.get("file_name", "unknown")
+        doc_text = vector_store.get_document_text(doc_id)
+        
+        doc_block = f"--- TÀI LIỆU: {file_name} ---\n{doc_text}\n"
+        all_texts.append(doc_block)
+        total_length += len(doc_block)
+    
+    # Safe limit: 60,000 characters (approx 15-20k tokens for Qwen3-4B which supports 32k)
+    SAFE_CHAR_LIMIT = 60000
+    
+    if total_length > 0 and total_length <= SAFE_CHAR_LIMIT:
+        print(f"[chat_tool] Using FULL TEXT extraction. Total length: {total_length} chars.")
+        context = "\n".join(all_texts)
+    else:
+        # Fallback to RAG if documents are too large
+        full_text_mode = False
+        print(f"[chat_tool] Documents too large ({total_length} chars). Falling back to RAG.")
+        
+        # Calculate dynamic top_k per document to ensure all docs are represented
+        if len(doc_ids) == 1:
+            top_k_per_doc = 15
+        elif len(doc_ids) <= 3:
+            top_k_per_doc = 7
+        elif len(doc_ids) <= 6:
+            top_k_per_doc = 5
+        else:
+            top_k_per_doc = 3
+            
+        all_results = []
+        for doc_id in doc_ids:
+            results = vector_store.search(query, doc_ids=[doc_id], top_k=top_k_per_doc)
+            all_results.extend(results)
+            
+        if not all_results:
+            return "Không tìm thấy thông tin liên quan trong tài liệu."
+            
+        for r in all_results:
+            meta = r.get("metadata", {})
+            file_name = meta.get("file_name", "unknown")
+            element_id = meta.get("element_id", "?")
+            content = r.get("content", "")
+            context_parts.append(f"[{file_name} - {element_id}] {content}")
+            
+        context = "\n".join(context_parts)
     
     prompt = f"""Dựa trên nội dung tài liệu dưới đây, hãy trả lời câu hỏi.
 Chỉ trả lời dựa trên thông tin có trong tài liệu, không bịa thêm.
