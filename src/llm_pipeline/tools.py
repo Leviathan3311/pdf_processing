@@ -60,8 +60,8 @@ def chat_tool(query: str) -> str:
     if not doc_ids:
         return "Chưa có tài liệu nào được chỉ định để trả lời câu hỏi. Vui lòng kiểm tra lại tải lên."
     
-    context_parts = []
     
+
     # First, try to fetch the FULL text for all selected documents
     # to avoid context fragmentation (especially useful for tables/statistics across multiple files).
     full_text_mode = True
@@ -108,18 +108,58 @@ def chat_tool(query: str) -> str:
             
         if not all_results:
             return "Không tìm thấy thông tin liên quan trong tài liệu."
-            
+        
+        # Separate paragraphs and table cells for proper reconstruction
+        para_parts = []
+        table_cells_by_table = {}  # (file_name, table_id) -> {(row, col): content}
+        table_max_dims = {}  # (file_name, table_id) -> (max_row, max_col)
+        
         for r in all_results:
             meta = r.get("metadata", {})
             file_name = meta.get("file_name", "unknown")
             element_id = meta.get("element_id", "?")
-            content = r.get("content", "")
-            context_parts.append(f"[{file_name} - {element_id}] {content}")
+            element_type = meta.get("element_type", "")
+            content = meta.get("original_content", "") or r.get("content", "")
             
-        context = "\n".join(context_parts)
+            if element_type == "table_cell":
+                table_id = meta.get("table_id", "")
+                row = meta.get("row", 0)
+                col = meta.get("col", 0)
+                key = (file_name, table_id)
+                
+                if key not in table_cells_by_table:
+                    table_cells_by_table[key] = {}
+                    table_max_dims[key] = (-1, -1)
+                
+                table_cells_by_table[key][(row, col)] = content
+                mr, mc = table_max_dims[key]
+                table_max_dims[key] = (max(mr, row), max(mc, col))
+            else:
+                para_parts.append(f"[{file_name} - {element_id}] {content}")
+        
+        # Reconstruct table cells into Markdown tables
+        for (file_name, table_id), cells in table_cells_by_table.items():
+            max_row, max_col = table_max_dims[(file_name, table_id)]
+            para_parts.append(f"\n[{file_name} - {table_id}] Bảng dữ liệu (trích xuất một phần):")
+            for row in range(max_row + 1):
+                row_parts = []
+                for col in range(max_col + 1):
+                    cell_text = cells.get((row, col), "...")
+                    cell_text = cell_text.replace("\n", " ").strip()
+                    row_parts.append(cell_text)
+                para_parts.append("| " + " | ".join(row_parts) + " |")
+                if row == 0:
+                    para_parts.append("|" + "|".join(["---"] * (max_col + 1)) + "|")
+            
+        context = "\n".join(para_parts)
     
     prompt = f"""Dựa trên nội dung tài liệu dưới đây, hãy trả lời câu hỏi.
-Chỉ trả lời dựa trên thông tin có trong tài liệu, không bịa thêm.
+
+QUY TẮC BẮT BUỘC:
+1. CHỈ sử dụng thông tin CÓ TRONG tài liệu bên dưới. TUYỆT ĐỐI KHÔNG bịa thêm hay tự sáng tạo dữ liệu.
+2. Khi trích dẫn dữ liệu bảng, phải SAO CHÉP CHÍNH XÁC từng giá trị ô (cell) từ bảng Markdown, giữ nguyên tên người, địa chỉ, số liệu, không được thay đổi hay tóm tắt lại.
+3. Nếu tài liệu chứa bảng dạng Markdown (dùng ký tự | và ---), hãy đọc theo hàng và cột, mỗi ô phân cách bởi dấu |.
+4. Nếu thông tin không có trong tài liệu, trả lời: "Thông tin này không có trong tài liệu."
 
 === NỘI DUNG TÀI LIỆU ===
 {context}

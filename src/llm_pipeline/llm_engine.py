@@ -311,7 +311,7 @@ def run_agent(query: str, tools: list, max_steps: int = 3, session_id: str = "de
     system_prompt = """Bạn là trợ lý xử lý tài liệu thông minh, thân thiện.
 
 KHI NÀO GỌI TOOL:
-- Dùng `chat_tool` khi người dùng hỏi nội dung, yêu cầu tóm tắt, trích xuất thông tin từ tài liệu đã upload.
+- Dùng `chat_tool` khi người dùng hỏi nội dung, yêu cầu tóm tắt, lập bảng, trích xuất, thống kê thông tin từ tài liệu đã upload.
 - Dùng `compare_tool` khi người dùng yêu cầu so sánh 2 tài liệu.
 - Dùng `edit_tool` khi người dùng yêu cầu sửa một điểm cụ thể trong tài liệu.
 - Dùng `batch_rewrite_tool` khi người dùng yêu cầu viết lại TOÀN BỘ tài liệu. Truyền toàn bộ thông tin tổng hợp vào tham số `context`.
@@ -325,6 +325,7 @@ QUY TẮC BẮT BUỘC:
    - NẾU trước đó đã có yêu cầu xử lý (VD: "tóm tắt", "dịch") → tự động gọi tool thực hiện ngay.
    - NẾU chưa có yêu cầu nào → hỏi người dùng muốn làm gì với tài liệu vừa tải lên.
 2. NẾU người dùng yêu cầu thao tác trên tài liệu nhưng "Tài liệu hiện có" đang là "Chưa có tài liệu nào." → Báo lỗi thân thiện và hướng dẫn upload.
+3. TUYỆT ĐỐI KHÔNG được chỉ mô tả "tôi sẽ gọi tool" hay "tôi cần gọi tool" — bạn PHẢI thực sự gọi tool ngay lập tức. Không hỏi lại, không giải thích trước, HÃY GỌI TOOL NGAY.
 
 Khi trả lời dạng bảng thống kê, dùng format bảng Markdown (| và ---).
 Luôn trả lời bằng tiếng Việt, rõ ràng, ngắn gọn."""
@@ -412,6 +413,50 @@ Luôn trả lời bằng tiếng Việt, rõ ràng, ngắn gọn."""
                 print(f"[Agent Error] Tool formatting error: {e}")
                 messages.append({"role": "tool", "name": "error", "content": f"Lỗi gọi tool: {e}"})
                 continue
+        
+        # ── FALLBACK: Model described a tool call in plain text without <tool_call> tag ──
+        # Common with small models: "tôi cần gọi chat_tool" or "I'll use chat_tool"
+        if step == 0:  # Only on first step to avoid infinite loops
+            mentioned_tool = None
+            response_lower = response_text.lower()
+            # Check if model mentions a tool name in plain text
+            for tname in tool_map:
+                if tname in response_lower:
+                    mentioned_tool = tname
+                    break
+            
+            if mentioned_tool:
+                print(f"[Agent] ⚠️ Model described '{mentioned_tool}' without calling it. Auto-invoking fallback...")
+                # Determine the appropriate argument based on tool type
+                actual_query = raw_user_message if raw_user_message else query
+                if mentioned_tool == "chat_tool":
+                    tool_args = {"query": actual_query}
+                elif mentioned_tool == "compare_tool":
+                    tool_args = {"input_text": actual_query}
+                elif mentioned_tool == "edit_tool":
+                    tool_args = {"instruction": actual_query}
+                elif mentioned_tool == "batch_rewrite_tool":
+                    tool_args = {"instruction": actual_query, "context": ""}
+                else:
+                    tool_args = {"query": actual_query}
+                
+                try:
+                    tool_result = str(tool_map[mentioned_tool].invoke(tool_args))
+                    
+                    # Track files
+                    if "_Revised.docx" in tool_result:
+                        m = re.search(r'[\w\-./\\, ]+_Revised\.docx', tool_result)
+                        if m:
+                            generated_files.append(Path(m.group()).name)
+                    
+                    messages.append({
+                        "role": "tool",
+                        "name": mentioned_tool,
+                        "content": tool_result
+                    })
+                    continue  # loop back to let LLM generate final answer
+                except Exception as e:
+                    print(f"[Agent Error] Fallback tool invocation error: {e}")
                 
         # If no tool tag is found, this is the final answer
         break

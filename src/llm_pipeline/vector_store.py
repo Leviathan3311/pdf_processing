@@ -195,13 +195,75 @@ def get_full_document(doc_id: str, collection_name: str = "documents") -> list[d
 
 
 def get_document_text(doc_id: str, collection_name: str = "documents") -> str:
-    """Get full document content as formatted text for LLM context."""
+    """
+    Get full document content as formatted text for LLM context.
+    
+    Tables are reconstructed into Markdown table format to preserve
+    the 2D row/column structure. This prevents the LLM from hallucinating
+    when it sees fragmented cell-by-cell flat text.
+    """
     elements = get_full_document(doc_id, collection_name)
     lines = []
-    for el in elements:
-        eid = el.get("metadata", {}).get("element_id", "?")
-        content = el.get("content", "")
-        lines.append(f"[{eid}] {content}")
+    
+    # Group elements into paragraphs and tables
+    i = 0
+    while i < len(elements):
+        el = elements[i]
+        meta = el.get("metadata", {})
+        etype = meta.get("element_type", "")
+        eid = meta.get("element_id", "?")
+        
+        if etype == "table_cell":
+            # Collect all cells of the same table
+            table_id = meta.get("table_id", "")
+            table_cells = {}  # (row, col) -> content
+            max_row = -1
+            max_col = -1
+            
+            while i < len(elements):
+                el_t = elements[i]
+                meta_t = el_t.get("metadata", {})
+                if meta_t.get("element_type", "") != "table_cell":
+                    break
+                if meta_t.get("table_id", "") != table_id:
+                    break
+                
+                row = meta_t.get("row", 0)
+                col = meta_t.get("col", 0)
+                # Use original_content if available (raw text without context enrichment)
+                content = meta_t.get("original_content", "") or el_t.get("content", "")
+                
+                table_cells[(row, col)] = content
+                if row > max_row:
+                    max_row = row
+                if col > max_col:
+                    max_col = col
+                i += 1
+            
+            # Build Markdown table
+            if table_cells:
+                lines.append(f"\n[{table_id}] Bảng dữ liệu:")
+                
+                for row in range(max_row + 1):
+                    row_parts = []
+                    for col in range(max_col + 1):
+                        cell_text = table_cells.get((row, col), "")
+                        # Clean cell text: replace newlines with spaces, strip
+                        cell_text = cell_text.replace("\n", " ").strip()
+                        row_parts.append(cell_text)
+                    lines.append("| " + " | ".join(row_parts) + " |")
+                    
+                    # Add separator after header row (row 0)
+                    if row == 0:
+                        lines.append("|" + "|".join(["---"] * (max_col + 1)) + "|")
+                
+                lines.append("")  # blank line after table
+        else:
+            # Regular paragraph
+            content = meta.get("original_content", "") or el.get("content", "")
+            lines.append(f"[{eid}] {content}")
+            i += 1
+    
     return "\n".join(lines)
 
 
