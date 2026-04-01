@@ -61,6 +61,102 @@ Question: {input}
 Thought: {agent_scratchpad}"""
 
 
+# ─────────────────────────────────────────────────────────────
+# Intent Classification
+# ─────────────────────────────────────────────────────────────
+
+# Keyword fast-path: các pattern rõ ràng là casual chat
+_CASUAL_PATTERNS = [
+    # Chào hỏi
+    r"\b(hello|hi|hey|xin chào|chào|alo)\b",
+    # Hỏi thăm
+    r"\b(bạn khỏe|bạn có khỏe|khỏe không|sao rồi|thế nào)\b",
+    # Cảm ơn / tạm biệt
+    r"\b(cảm ơn|camon|thanks|thank you|tạm biệt|bye|goodbye)\b",
+    # Khen ngợi
+    r"\b(tốt lắm|giỏi lắm|hay lắm|tuyệt|awesome|great|good job|well done)\b",
+    # Câu phiếm
+    r"\b(bạn là ai|bạn tên gì|bạn làm được gì|bạn có thể làm gì|giới thiệu bản thân)\b",
+    # Biểu cảm đơn giản
+    r"^(ok|okay|oke|được|rồi|vâng|dạ|ừ|uhh?|hmm+|ah+|oh+|wow)[!?.]*$",
+]
+
+_CASUAL_REGEX = re.compile(
+    "|".join(_CASUAL_PATTERNS),
+    re.IGNORECASE | re.UNICODE,
+)
+
+# Keyword fast-path: các pattern rõ ràng là document task
+_DOCUMENT_PATTERNS = [
+    r"\b(tài liệu|file|hợp đồng|văn bản|tóm tắt|so sánh|sửa|chỉnh|edit|upload|tải lên)\b",
+    r"\b(docx|pdf|xlsx|doc)\b",
+    r"\b(bảng|điều khoản|điều kiện|giá|số liệu|thông tin trong|nội dung)\b",
+    r"\b(summarize|summary|compare|extract|modify|rewrite)\b",
+]
+
+_DOCUMENT_REGEX = re.compile(
+    "|".join(_DOCUMENT_PATTERNS),
+    re.IGNORECASE | re.UNICODE,
+)
+
+
+def classify_intent(query: str) -> str:
+    """
+    Classify user query intent into one of:
+      - "casual"   : general conversation, greetings, small talk
+      - "document" : document Q&A, editing, comparison tasks
+      - "ambiguous": unclear, let the agent loop decide
+
+    Uses keyword fast-path first to avoid extra GPU calls.
+    Falls back to "ambiguous" for the agent loop to handle gracefully.
+    """
+    query_stripped = query.strip()
+
+    # Fast path 1: obvious casual (short + matches casual patterns)
+    if _CASUAL_REGEX.search(query_stripped):
+        # Extra guard: if it also mentions document keywords, treat as ambiguous
+        if not _DOCUMENT_REGEX.search(query_stripped):
+            return "casual"
+
+    # Fast path 2: obvious document task
+    if _DOCUMENT_REGEX.search(query_stripped):
+        return "document"
+
+    # Fast path 3: very short queries with no document keywords → likely casual
+    word_count = len(query_stripped.split())
+    if word_count <= 4 and not _DOCUMENT_REGEX.search(query_stripped):
+        return "casual"
+
+    # Everything else → let agent loop handle it (model decides whether to call tools)
+    return "ambiguous"
+
+
+def _generate_casual_response(query: str, session_id: str) -> str:
+    """
+    Generate a natural casual response using generate_raw().
+    Bypasses the tool-calling agent loop entirely.
+    """
+    global _session_histories
+
+    history = _session_histories.get(session_id, [])
+
+    # Build a compact history string (last 6 turns max)
+    history_text = ""
+    for msg in history[-12:]:
+        role = "Người dùng" if msg["role"] == "user" else "Trợ lý"
+        history_text += f"{role}: {msg['content']}\n"
+
+    prompt = f"""Bạn là trợ lý AI thân thiện, chuyên hỗ trợ xử lý tài liệu nhưng cũng có thể trò chuyện bình thường.
+Trả lời tự nhiên, ngắn gọn, thân thiện. Không đề cập đến tool hay tài liệu trừ khi người dùng hỏi.
+Luôn trả lời bằng tiếng Việt.
+
+{f"Lịch sử hội thoại gần đây:{chr(10)}{history_text}" if history_text else ""}
+Người dùng: {query}
+Trợ lý:"""
+
+    return generate_raw(prompt, max_new_tokens=512)
+
+
 def get_model_path() -> str:
     """Get the default model path."""
     root = Path(__file__).resolve().parent.parent.parent
@@ -152,9 +248,42 @@ def get_langchain_llm(model_path: str = None, load_4bit: bool = True, load_8bit:
 
 def run_agent(query: str, tools: list, max_steps: int = 3, session_id: str = "default", raw_user_message: str = None) -> dict:
     """
-    Native Qwen3 tool-calling loop.
-    Bypasses LangGraph to ensure 100% accurate tool-call parsing with local HF models.
+    Native Qwen3 tool-calling loop with intent-aware routing.
+
+    Flow:
+      1. classify_intent() → "casual" | "document" | "ambiguous"
+      2. "casual"   → _generate_casual_response() via generate_raw(), skip agent loop
+      3. "document" / "ambiguous" → full agent tool-calling loop
+
+    The agent system prompt no longer forces tool calls, so for "ambiguous"
+    queries the model can freely choose to respond directly or call a tool.
     """
+    global _session_histories
+
+    # ── Step 1: Intent classification (keyword fast-path, no GPU cost) ──
+    # IMPORTANT: classify on raw_user_message (not augmented query which contains
+    # document context like "Tài liệu hiện có:..." that would skew the classifier)
+    text_to_classify = raw_user_message if raw_user_message else query
+    intent = classify_intent(text_to_classify)
+    print(f"[Agent] 🧭 Intent: '{intent}' for message: '{text_to_classify[:60]}...'" if len(text_to_classify) > 60 else f"[Agent] 🧭 Intent: '{intent}' for message: '{text_to_classify}'")
+
+    # ── Step 2: Casual fast-path ──
+    if intent == "casual":
+        print("[Agent] 💬 Routing to casual chat (bypassing tool loop)")
+        actual_query = raw_user_message if raw_user_message else query
+        response = _generate_casual_response(actual_query, session_id)
+
+        # Save to history
+        user_msg_to_save = raw_user_message if raw_user_message else query
+        if session_id not in _session_histories:
+            _session_histories[session_id] = []
+        _session_histories[session_id].append({"role": "user", "content": user_msg_to_save})
+        _session_histories[session_id].append({"role": "assistant", "content": response})
+
+        _safe_cuda_cleanup()
+        return {"output": response, "files": []}
+
+    # ── Step 3: Document / ambiguous → full agent loop ──
     model, tokenizer = load_model()
     
     # 1. Prepare native HuggingFace tool schemas
@@ -177,26 +306,29 @@ def run_agent(query: str, tools: list, max_steps: int = 3, session_id: str = "de
                 "parameters": param_schema
             }
         })
-        
-    system_prompt = """Bạn là trợ lý xử lý tài liệu thông minh.
-CHÚ Ý QUAN TRỌNG: KIẾN THỨC VÀ NỘI DUNG TÀI LIỆU KHÔNG ĐƯỢC CUNG CẤP TRONG PROMPT NÀY.
-Bạn BẮT BUỘC phải gọi công cụ (tool) tương ứng để tìm thông tin trước khi trả lời.
-- Dùng `chat_tool` để hỏi về nội dung, tóm tắt, lập bảng thống kê, trích xuất thông tin.
-- Dùng `compare_tool` để so sánh 2 tài liệu.
-- Dùng `edit_tool` để chỉnh sửa ĐIỂM NHỎ trong tài liệu.
-- Dùng `batch_rewrite_tool` khi người dùng yêu cầu viết lại TOÀN BỘ tài liệu/file mẫu. Quan trọng: Trích xuất kết quả tổng hợp/thông tin từ lịch sử và TRUYỀN toàn bộ vào tham số `context` của tool này.
+
+    # ── Updated system prompt: model decides whether to call tools ──
+    system_prompt = """Bạn là trợ lý xử lý tài liệu thông minh, thân thiện.
+
+KHI NÀO GỌI TOOL:
+- Dùng `chat_tool` khi người dùng hỏi nội dung, yêu cầu tóm tắt, trích xuất thông tin từ tài liệu đã upload.
+- Dùng `compare_tool` khi người dùng yêu cầu so sánh 2 tài liệu.
+- Dùng `edit_tool` khi người dùng yêu cầu sửa một điểm cụ thể trong tài liệu.
+- Dùng `batch_rewrite_tool` khi người dùng yêu cầu viết lại TOÀN BỘ tài liệu. Truyền toàn bộ thông tin tổng hợp vào tham số `context`.
+
+KHI NÀO KHÔNG CẦN GỌI TOOL:
+- Câu hỏi về khả năng của bạn, hướng dẫn sử dụng → trả lời thẳng.
+- Người dùng chưa upload tài liệu mà hỏi thông tin chung → hướng dẫn họ upload trước.
 
 QUY TẮC BẮT BUỘC:
 1. Khi có tin nhắn thông báo "[Tài liệu đã tải lên:...]":
-   - NẾU trước đó đã có yêu cầu xử lý (VD: "tóm tắt", "dịch") → bạn phải tự động gọi tool thực hiện yêu cầu đó ngay lập tức.
-   - NẾU trước đó chưa có yêu cầu nào → hãy chào và hỏi người dùng xem họ muốn làm gì với tài liệu vừa tải lên.
-2. NẾU người dùng yêu cầu thao tác trên tài liệu nhưng danh sách "Tài liệu hiện có" đang là "Chưa có tài liệu nào." → Hãy báo lỗi thân thiện rằng bạn chưa nhận được tài liệu nào và cần họ tải lên trước.
+   - NẾU trước đó đã có yêu cầu xử lý (VD: "tóm tắt", "dịch") → tự động gọi tool thực hiện ngay.
+   - NẾU chưa có yêu cầu nào → hỏi người dùng muốn làm gì với tài liệu vừa tải lên.
+2. NẾU người dùng yêu cầu thao tác trên tài liệu nhưng "Tài liệu hiện có" đang là "Chưa có tài liệu nào." → Báo lỗi thân thiện và hướng dẫn upload.
 
-Khi trả lời dạng bảng thống kê, hãy sử dụng format bảng Markdown (dùng | và ---) để hiển thị dữ liệu rõ ràng.
+Khi trả lời dạng bảng thống kê, dùng format bảng Markdown (| và ---).
+Luôn trả lời bằng tiếng Việt, rõ ràng, ngắn gọn."""
 
-Luôn trả lời bằng tiếng Việt rõ ràng, ngắn gọn."""
-
-    global _session_histories
     if session_id not in _session_histories:
         _session_histories[session_id] = []
 

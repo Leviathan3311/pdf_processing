@@ -67,7 +67,7 @@ async def chat(request: ChatRequest):
         
         system_reminder = ""
         if not available_docs and not request.message.strip().startswith("[Tài liệu"):
-            system_reminder = "\n\n[HỆ THỐNG CẢNH BÁO AI: Hiện chưa có tài liệu nào được cung cấp. Bạn BẮT BUỘC phải thông báo cho người dùng biết lỗi này và yêu cầu tải tài liệu lên.]"
+            system_reminder = "\n\n[HỆ THỐNG CẢNH BÁO AI: Hiện tại chưa có tài liệu nào được cung cấp. Nếu người dùng yêu cầu xử lý, tóm tắt, so sánh hoặc trích xuất thông tin từ tài liệu, bạn BẮT BUỘC thông báo lỗi và yêu cầu tải lên. Nếu người dùng hỏi kiến thức chung hoặc trò chuyện bình thường, hãy trả lời bình thường nhưng ngắn gọn.]"
             
         # Enhance the user message with context about available documents
         enhanced_input = f"""Tài liệu hiện có:
