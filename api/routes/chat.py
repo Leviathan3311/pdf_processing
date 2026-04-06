@@ -55,8 +55,9 @@ async def chat(request: ChatRequest):
         available_docs = []
         doc_ids_to_use = request.doc_ids  # Only use explicitly provided docs for session isolation
         
-        # Scope the tools to the current request doc_ids
+        # Scope the tools to the current request doc_ids and session
         tools.current_request_doc_ids.set(doc_ids_to_use)
+        tools.current_session_id.set(request.session_id)
         
         for doc_id in doc_ids_to_use:
             info = tools.get_doc_info(doc_id)

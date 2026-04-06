@@ -1,11 +1,14 @@
 """
-LangChain Tools - 3 tools for the Agent.
+LangChain Tools - 5 tools for the Agent.
 
-1. chat_tool: Q&A + summarize (RAG-based)
+1. chat_tool: Q&A + summarize (RAG-based) — auto-saves summary to session context
 2. compare_tool: Compare two documents 
 3. edit_tool: Modify document content → JSON output → doc surgery → .docx file
+4. batch_rewrite_tool: Rewrite ENTIRE document with context from session
+5. export_tool: Export uploaded document as Word or PDF for download
 """
 import json
+import re
 from typing import Optional
 import contextvars
 
@@ -18,11 +21,144 @@ from llm_pipeline import doc_surgery
 # Context variable to hold doc_ids for the current API request
 current_request_doc_ids = contextvars.ContextVar("current_request_doc_ids", default=None)
 
+# Context variable to hold session_id for the current API request
+current_session_id = contextvars.ContextVar("current_session_id", default="default")
+
 # ─────────────────────────────────────────────────────────────
 # Store for document metadata (doc_id → file_name, docx_path)
 # Populated during upload. Shared across tools.
 # ─────────────────────────────────────────────────────────────
 _doc_registry: dict[str, dict] = {}
+
+# ─────────────────────────────────────────────────────────────
+# Session Context Store
+# Stores important results (summaries, key info) per session.
+# This allows batch_rewrite_tool to access accumulated context
+# WITHOUT relying on the small LLM to pass it correctly.
+# ─────────────────────────────────────────────────────────────
+_session_contexts: dict[str, list[str]] = {}
+
+
+def save_session_context(session_id: str, context: str):
+    """Save important context (summary result, key info) for later use by rewrite tools.
+
+    Only saves if the content looks like real document content (not a greeting,
+    upload acknowledgement, or error message).  This prevents the session context
+    from being polluted when the agent auto-responds to a file upload with a short
+    acknowledgement phrase.
+    """
+    if not context or not context.strip():
+        return
+
+    # Don't save obviously non-content responses
+    _NOISE_PHRASES = [
+        "bạn muốn làm gì", "tôi đã nhận được", "tài liệu đã được tải",
+        "bạn cần tôi làm gì", "tôi có thể giúp gì",
+        "xin chào", "vui lòng upload", "chưa có tài liệu",
+        "lỗi", "error",
+    ]
+    ctx_lower = context.strip().lower()
+    if any(phrase in ctx_lower for phrase in _NOISE_PHRASES):
+        print(f"[Session Context] ⏭️ Skipped saving noise/greeting message for session '{session_id}'")
+        return
+    # Also skip very short responses (< 80 chars) — likely not real document content
+    if len(context.strip()) < 80:
+        print(f"[Session Context] ⏭️ Skipped saving short response ({len(context.strip())} chars)")
+        return
+
+    if session_id not in _session_contexts:
+        _session_contexts[session_id] = []
+    # Keep only the last 5 contexts to avoid memory bloat
+    _session_contexts[session_id].append(context.strip())
+    if len(_session_contexts[session_id]) > 5:
+        _session_contexts[session_id] = _session_contexts[session_id][-5:]
+    print(f"[Session Context] ✓ Saved context for session '{session_id}' ({len(context)} chars)")
+
+
+def get_session_context(session_id: str, most_recent_only: bool = True) -> str:
+    """Get session context for the given session.
+
+    Args:
+        session_id: The session to fetch context for.
+        most_recent_only: When True (default), returns only the MOST RECENT saved
+            context.  This is the safe default for batch_rewrite_tool: if the user
+            summarised File A then uploaded File B and asked to rewrite it, we want
+            to fill File B with File A's summary — not a concatenation of both
+            summaries which would confuse the LLM.
+            Pass most_recent_only=False only when you explicitly want the full history
+            (e.g. for a compare or audit task).
+    """
+    contexts = _session_contexts.get(session_id, [])
+    if not contexts:
+        return ""
+    if most_recent_only:
+        return contexts[-1]
+    return "\n\n---\n\n".join(contexts)
+
+
+def _get_context_from_history(session_id: str) -> str:
+    """
+    Fallback: extract useful context from session history.
+    Searches for the most recent assistant message that looks like a real
+    summary/extraction result — skips upload acknowledgements, greetings,
+    error messages, and anything that is NOT document content.
+    """
+    from llm_pipeline.llm_engine import _session_histories
+    history = _session_histories.get(session_id, [])
+
+    # Phrases that indicate the message is NOT a useful document summary
+    _SKIP_PHRASES = [
+        "lỗi", "error",
+        "vui lòng",
+        "chưa có tài liệu",
+        "tool_call", "<tool_call>",
+        # Upload acknowledgements / greetings — these are NOT summaries
+        "bạn muốn làm gì",
+        "tôi đã nhận được",
+        "tài liệu đã được tải",
+        "tài liệu vừa tải lên",
+        "bạn cần tôi làm gì",
+        "tôi có thể giúp gì",
+        "xin chào", "hello",
+    ]
+
+    # Keywords that strongly suggest the message IS a real summary/extraction
+    _CONTENT_SIGNALS = [
+        "tổ chức", "đối tượng", "sự kiện", "thời gian", "địa điểm",  # event summaries
+        "mục đích", "yêu cầu", "nội dung", "thông tin",
+        "tóm tắt", "tổng hợp", "kết quả", "số liệu",
+        "điều khoản", "hợp đồng", "bên a", "bên b",
+    ]
+
+    for msg in reversed(history):
+        if msg["role"] != "assistant":
+            continue
+        content = msg["content"]
+        if len(content) < 100:
+            continue
+        content_lower = content.lower()
+
+        # Hard skip — clearly not a summary
+        if any(phrase in content_lower for phrase in _SKIP_PHRASES):
+            continue
+
+        # Prefer messages that have at least one content signal
+        if any(signal in content_lower for signal in _CONTENT_SIGNALS):
+            return content
+
+    # Second pass: no content signals found — return any non-skipped substantial message
+    for msg in reversed(history):
+        if msg["role"] != "assistant":
+            continue
+        content = msg["content"]
+        if len(content) < 100:
+            continue
+        content_lower = content.lower()
+        if any(phrase in content_lower for phrase in _SKIP_PHRASES):
+            continue
+        return content
+
+    return ""
 
 
 def register_document(doc_id: str, file_name: str, docx_path: str):
@@ -44,8 +180,9 @@ def get_all_doc_ids() -> list[str]:
 
 
 # ─────────────────────────────────────────────────────────────
-# Tool 1: Chat (Q&A + Summarize)
+# Tool 1: Chat (Q&A + Summarize) — always saves result to session context
 # ─────────────────────────────────────────────────────────────
+
 
 @tool
 def chat_tool(query: str) -> str:
@@ -60,7 +197,7 @@ def chat_tool(query: str) -> str:
     if not doc_ids:
         return "Chưa có tài liệu nào được chỉ định để trả lời câu hỏi. Vui lòng kiểm tra lại tải lên."
     
-    
+
 
     # First, try to fetch the FULL text for all selected documents
     # to avoid context fragmentation (especially useful for tables/statistics across multiple files).
@@ -169,7 +306,21 @@ QUY TẮC BẮT BUỘC:
 
 === TRẢ LỜI ==="""
     
-    return llm_engine.generate_raw(prompt)
+    result = llm_engine.generate_raw(prompt)
+    
+    # ── Always save the result to session context so batch_rewrite_tool
+    # can reliably retrieve it later, regardless of whether the user's query
+    # contained explicit summary keywords.
+    # Previously this only fired when _SUMMARY_KEYWORDS matched the query string
+    # that the LLM passed when calling the tool — which was fragile because the
+    # LLM might call chat_tool with a paraphrased instruction that doesn't contain
+    # the exact keywords, silently skipping the save and causing batch_rewrite_tool
+    # to fall back to the wrong history message.
+    session_id = current_session_id.get()
+    save_session_context(session_id, result)
+    print(f"[chat_tool] 📝 Auto-saved result as session context (session: {session_id}, {len(result)} chars)")
+    
+    return result
 
 
 # ─────────────────────────────────────────────────────────────
@@ -326,18 +477,125 @@ hãy trả về một JSON object chứa danh sách các thay đổi cần thự
         return f"Lỗi khi áp dụng sửa đổi: {str(e)}"
 
 
+# ─────────────────────────────────────────────────────────────
+# Tool 4: Batch Rewrite — Two-phase approach
+#
+# Problem: Qwen3-4B is too small to understand element-to-context
+# mapping in JSON format. It copies original text instead of replacing.
+#
+# Solution: Two-phase approach:
+#   Phase 1: Programmatically classify elements as structural/content
+#   Phase 2: Ask LLM to rewrite ONLY content elements (simpler task)
+# ─────────────────────────────────────────────────────────────
+
+# Patterns that identify structural/template elements (should NOT be rewritten)
+_STRUCTURAL_PATTERNS = re.compile(
+    r"(?i)("
+    r"cộng\s*ho[àa]\s*x[ãa]\s*h[ộo]i|"  # CỘNG HOÀ XÃ HỘI
+    r"độc\s*lập|tự\s*do|hạnh\s*phúc|"     # Độc lập - Tự do - Hạnh phúc
+    r"kính\s*gửi|"                          # Kính gửi
+    r"nơi\s*nhận|"                          # Nơi nhận
+    r"ngày.*tháng.*năm|"                    # ngày...tháng...năm
+    r"^(tl\.|kt\.|q\.|tm\.)|"              # TL. KT. Q. TM. (signatures)
+    r"phó\s*(giám\s*đốc|chủ\s*tịch|trưởng)|" # Phó Giám đốc etc
+    r"giám\s*đốc|chủ\s*tịch|trưởng\s*phòng|" # Giám đốc etc
+    r"ký\s*tên|chữ\s*ký|"                  # Ký tên, chữ ký
+    r"v/v:|số:|"                            # V/v:, Số:
+    r"^\s*$"                                # Empty
+    r")",
+    re.UNICODE
+)
+
+def _word_overlap_ratio(text1: str, text2: str) -> float:
+    """Calculate word-level Jaccard similarity between two texts.
+    Used to detect when LLM partially copied original content instead of rewriting.
+    Returns 0.0–1.0; values above ~0.35 indicate significant overlap with original.
+    """
+    if not text1 or not text2:
+        return 0.0
+    words1 = set(re.findall(r'\w+', text1.lower()))
+    words2 = set(re.findall(r'\w+', text2.lower()))
+    if not words1 or not words2:
+        return 0.0
+    return len(words1 & words2) / len(words1 | words2)
+
+
+def _classify_element(element: dict, index: int, total_elements: int, noi_nhan_idx: int) -> str:
+    """
+    Classify an element as 'structural' (keep) or 'content' (rewrite).
+    
+    Structural: headers, company names, signatures, dates, section numbers
+    Content: body paragraphs with actual report/document content
+    """
+    meta = element.get("metadata", {})
+    eid = meta.get("element_id", "")
+    etype = meta.get("element_type", "")
+    content = (meta.get("original_content", "") or element.get("content", "")).strip()
+    
+    # Explicit structural patterns
+    if _STRUCTURAL_PATTERNS.search(content):
+        return "structural"
+    
+    # Very short noise content
+    if len(content) < 10:
+        return "structural"
+        
+    is_header_region = index < 15
+    is_footer_region = (noi_nhan_idx != -1 and index >= noi_nhan_idx) or (index > total_elements - 5)
+    
+    if is_header_region or is_footer_region:
+        if etype == "table_cell" and (eid.startswith("Table_0_Cell_") or eid.startswith("Table_1_Cell_")):
+            return "structural"
+        if content == content.upper() and len(content) < 100:
+            return "structural"
+            
+    if is_footer_region:
+        if len(content) < 40:
+            return "structural"
+            
+    # Everything else in the middle of the document is content that should be rewritten
+    return "content"
+
+
 @tool
-def batch_rewrite_tool(instruction: str, context: str) -> str:
+def batch_rewrite_tool(instruction: str, context: str = "") -> str:
     """Viết lại (rewrite) TOÀN BỘ nội dung file tự động theo lô (batch).
-    Dùng công cụ này KHI người dùng yêu cầu viết lại toàn bộ file, hoặc dựa vào tổng hợp để ghi đè toàn bộ file mẫu.
-    Tham số `context` CẦN chứa toàn bộ thông tin/tổng hợp mà bạn muốn dùng để viết lại.
-    Tham số `instruction` là yêu cầu cụ thể (vd: 'Viết lại hợp đồng theo format')."""
+    Dùng công cụ này KHI người dùng yêu cầu viết lại toàn bộ file, sửa nội dung theo tóm tắt, hoặc xuất nội dung theo mẫu file.
+    Tham số `context` CẦN chứa toàn bộ thông tin/tổng hợp mà bạn muốn dùng để viết lại. Nếu để trống, hệ thống sẽ tự động lấy từ lịch sử hội thoại.
+    Tham số `instruction` là yêu cầu cụ thể (vd: 'Viết lại hợp đồng theo nội dung tóm tắt')."""
     
     req_docs = current_request_doc_ids.get()
     doc_ids = req_docs if req_docs is not None else get_all_doc_ids()
     
     if not doc_ids:
         return "Chưa có tài liệu nào được chỉ định để sửa đổi toàn bộ. Vui lòng kiểm tra lại tải lên."
+    
+    # ── Auto-fetch context if the LLM passed an empty/inadequate context ──
+    session_id = current_session_id.get()
+    
+    context_from_session = False  # Track whether context was auto-fetched (→ always template mode)
+
+    if not context or not context.strip() or len(context.strip()) < 50:
+        print(f"[batch_rewrite_tool] ⚠️ Context parameter is empty/short. Auto-fetching from session '{session_id}'...")
+        
+        # Priority 1: Saved session context (summaries from chat_tool)
+        saved_context = get_session_context(session_id)
+        if saved_context and len(saved_context) > 50:
+            context = saved_context
+            context_from_session = True
+            print(f"[batch_rewrite_tool] ✓ Using saved session context ({len(context)} chars)")
+        else:
+            # Priority 2: Extract from session history
+            history_context = _get_context_from_history(session_id)
+            if history_context:
+                context = history_context
+                context_from_session = True
+                print(f"[batch_rewrite_tool] ✓ Using history context ({len(context)} chars)")
+            else:
+                return ("Lỗi: Không tìm thấy thông tin tổng hợp/tóm tắt nào trong phiên hội thoại. "
+                        "Vui lòng tóm tắt hoặc cung cấp nội dung trước, sau đó yêu cầu viết lại.")
+    
+    print(f"[batch_rewrite_tool] Context preview (first 300 chars): {context[:300]}...")
     
     # Lấy tài liệu mới nhất (chính là template format) trong scoped context
     doc_id = doc_ids[-1]
@@ -352,80 +610,125 @@ def batch_rewrite_tool(instruction: str, context: str) -> str:
         
     docx_path = doc_info.get("docx_path", "")
     
-    # Lọc bỏ các elements trống trơn
+    # ══════════════════════════════════════════════════════════════
+    # PHASE 1: Classify elements as structural vs content
+    # ══════════════════════════════════════════════════════════════
     valid_elements = [el for el in elements if el.get("content", "").strip()]
     
-    # Chia thành các batch (4 đoạn mỗi batch) để inference song song mà không tràn VRAM
-    batch_size = 4
-    batches = []
-    for i in range(0, len(valid_elements), batch_size):
-        batches.append(valid_elements[i:i+batch_size])
-        
-    print(f"[Batch Rewrite] Bắt đầu xử lý song song {len(batches)} lô (mỗi lô {batch_size} đoạn)...")
-    
-    # Chuẩn bị prompts song song
-    prompts = []
-    for batch in batches:
-        doc_text_parts = []
-        for el in batch:
-            eid = el.get("metadata", {}).get("element_id", "?")
-            content = el.get("content", "")
-            doc_text_parts.append(f"[{eid}] {content}")
+    noi_nhan_idx = -1
+    for i, el in enumerate(valid_elements):
+        content = (el.get("metadata", {}).get("original_content", "") or el.get("content", "")).strip().lower()
+        if "nơi nhận" in content:
+            noi_nhan_idx = i
+            break
             
-        doc_text = "\n".join(doc_text_parts)
+    structural_elements = []  # Keep as-is (headers, signatures, dates...)
+    content_elements = []     # Rewrite with context
+    
+    total_elements = len(valid_elements)
+    
+    # ── MAPPING BODY REGION ──
+    # We find the FIRST and LAST element classified as "content".
+    # EVERYTHING in between must be considered "content" (to be wiped),
+    # so we don't accidentally leave old section headers (like "I. ĐẶC ĐIỂM")
+    # mixed in our newly inserted summary.
+    classifications = []
+    first_content_idx = -1
+    last_content_idx = -1
+    
+    for i, el in enumerate(valid_elements):
+        cls = _classify_element(el, i, total_elements, noi_nhan_idx)
+        classifications.append(cls)
+        if cls == "content":
+            if first_content_idx == -1:
+                first_content_idx = i
+            last_content_idx = i
+            
+    if first_content_idx == -1:
+        return "Không tìm thấy đoạn nội dung nào cần viết lại trong tài liệu mẫu."
         
-        prompt = f"""Bạn là hệ thống tự động viết lại tài liệu. Dựa trên thông tin tổng hợp (context), hãy viết lại các đoạn văn bản sau sao cho phù hợp, GIỮ NGUYÊN cấu trúc ID.
+    for i, el in enumerate(valid_elements):
+        meta = el.get("metadata", {})
+        eid = meta.get("element_id", "?")
+        content = (meta.get("original_content", "") or el.get("content", "")).strip()
+        
+        # Override classification: if it's within the body boundaries, it's body!
+        if first_content_idx <= i <= last_content_idx:
+            content_elements.append(el)
+            print(f"  [REWRITE/BODY] {eid}: {content[:60]}...")
+        else:
+            structural_elements.append(el)
+            print(f"  [KEEP/STRUCT]  {eid}: {content[:60]}...")
+            
+    print(f"\n[Batch Rewrite] Structural (keep): {len(structural_elements)}, Content (rewrite & wipe): {len(content_elements)}")
+    
+    # ── Replace Body Mode ──
+    # Always use replace_body mode since this tool is specifically for
+    # completely rewriting the document, and the user explicitly requested
+    # creating a new document with same structural format but new content.
+    print(f"[Batch Rewrite] ⚡ Chế độ Replace Body: Yêu cầu LLM viết lại nội dung tự nhiên, sau đó map vào file mẫu.")
+    
+    # ══════════════════════════════════════════════════════════════
+    # PHASE 2: Rewrite Strategy
+    # ══════════════════════════════════════════════════════════════
+    # Gather original text to pass to LLM as style reference
+    original_text_parts = []
+    for el in content_elements:
+        content = (el.get("metadata", {}).get("original_content", "") or el.get("content", "")).strip()
+        if content:
+            original_text_parts.append(content)
+            
+    original_text = "\n".join(original_text_parts)
+    # Target length ~8000 chars to save tokens while giving enough style context
+    if len(original_text) > 8000:
+        original_text = original_text[:8000] + "\n...[lược bớt]..."
 
-=== THÔNG TIN TỔNG HỢP (CONTEXT) ===
+    prompt = f"""Bạn là một chuyên gia soạn thảo văn bản hành chính.
+Nhiệm vụ của bạn là viết lại phần thân của một văn bản hoàn chỉnh, tự nhiên và chuyên nghiệp dựa trên BẢN TÓM TẮT.
+Tuy nhiên, bạn PHẢI BẮT CHƯỚC VĂN PHONG, cách trình bày (có chia mục, gạch đầu dòng, giọng điệu...) của VĂN BẢN MẪU.
+
+=== VĂN BẢN MẪU (THAM KHẢO VĂN PHONG VÀ CẤU TRÚC) ===
+{original_text}
+
+=== BẢN TÓM TẮT MỚI (Dữ liệu nội dung cần được đưa vào) ===
 {context}
 
-=== YÊU CẦU SỬA ĐỔI ===
+=== YÊU CẦU CỦA NGƯỜI DÙNG ===
 {instruction}
 
-=== CÁC ĐOẠN VĂN BẢN HIỆN TẠI (mỗi dòng có format [ID] nội dung) ===
-{doc_text}
+=== QUY TẮC BẮT BUỘC ===
+1. CHỈ viết nội dung phần thân của văn bản (KHÔNG viết tiêu đề, KHÔNG viết quốc hiệu, KHÔNG viết chữ ký hay nơi nhận).
+2. Nội dung chính PHẢI bám sát BẢN TÓM TẮT MỚI. Tuyệt đối KHÔNG giữ lại các sự kiện/số liệu của VĂN BẢN MẪU nếu Bản Tóm Tắt Mới không nhắc đến.
+3. CÁCH HÀNH VĂN, cách chia mục (I, II, 1, 2...), cách đặt câu chữ chuyên ngành phải GIỐNG VỚI VĂN BẢN MẪU.
+4. KHÔNG sử dụng các thẻ [ID] hay vẽ lại bảng. Chỉ trình bày nội dung bằng văn bản thuần túy (các đoạn cách nhau khoảng trắng).
 
-=== QUY TẮC ===
-1. Dựa vào thông tin tổng hợp, viết lại hoặc thay thế thông tin trong các đoạn văn bản trên.
-2. Trả về ĐÚNG format JSON sau, KHÔNG giải thích thêm:
-
-```json
-{{
-  "modifications": [
-    {{"id": "element_id ở đây", "new_text": "nội dung MỚI đã được viết lại ở đây"}},
-    {{"id": "element_id tiếp theo", "new_text": "nội dung MỚI ở đây"}}
-  ]
-}}
-```
-
-3. "id" phải giữ y nguyên từ chữ số trong ngoặc vuông (ví dụ: "Para_0").
-4. Nếu một đoạn văn bản KHÔNG chứa thông tin cần thay đổi theo context, hãy giữ nguyên chữ của nó vào "new_text".
-
-=== JSON OUTPUT ==="""
-        prompts.append(prompt)
-        
-    # Chạy song song Tensor (Parallel Inference)
-    responses = llm_engine.generate_raw_batch(prompts, max_new_tokens=4096)
+BẮT ĐẦU VIẾT VĂN BẢN:
+"""
+    response = llm_engine.generate_raw(prompt, max_new_tokens=4096)
     
-    all_modifications = []
-    for resp in responses:
-        try:
-            json_str = resp
-            if "```json" in json_str:
-                json_str = json_str.split("```json")[1].split("```")[0].strip()
-            elif "```" in json_str:
-                json_str = json_str.split("```")[1].split("```")[0].strip()
-            
-            mods = json.loads(json_str)
-            all_modifications.extend(mods.get("modifications", []))
-        except Exception as e:
-            print(f"[Batch Rewrite Error] Lỗi parse JSON trong 1 batch: {e}")
-            continue
-            
-    if not all_modifications:
-        return "Lỗi: Không thể sinh ra tệp thay đổi JSON tương ứng do lỗi LLM Format ở toàn bộ batch."
+    import re
+    # Loại bỏ các block code markdown (nếu LLM có in thừa)
+    response = re.sub(r"```[^\n]*\n(.*?)```", r"\1", response, flags=re.DOTALL)
+    
+    # Chia nhỏ đoạn văn bản LLM sinh ra thành các đoạn văn riêng biệt
+    summary_paras = [p.strip() for p in response.split('\n') if p.strip()]
+    
+    if not summary_paras:
+        print("[Batch Rewrite] ⚠️ LLM trả về rỗng, dùng fallback context...")
+        summary_paras = [p.strip() for p in context.split('\n') if p.strip()]
+
+    # Collect all content element IDs
+    content_eids = [el.get("metadata", {}).get("element_id", "?") for el in content_elements if "element_id" in el.get("metadata", {})]
+    
+    modifications = {
+        "action": "replace_body",
+        "content_eids": content_eids,
+        "new_paragraphs": summary_paras
+    }
         
-    # Áp dụng modifications qua doc surgery một lần duy nhất
+    # ══════════════════════════════════════════════════════════════
+    # PHASE 3: Apply modifications via doc surgery
+    # ══════════════════════════════════════════════════════════════
     try:
         from pathlib import Path
         output_dir = Path(docx_path).parent.parent / "outputs"
@@ -433,7 +736,7 @@ def batch_rewrite_tool(instruction: str, context: str) -> str:
         
         revised_path = doc_surgery.apply_modifications(
             docx_path=docx_path,
-            modifications={"modifications": all_modifications},
+            modifications=modifications,
             output_dir=str(output_dir),
         )
         
@@ -442,6 +745,63 @@ def batch_rewrite_tool(instruction: str, context: str) -> str:
         return f"Lỗi khi áp dụng sửa đổi: {str(e)}"
 
 
+# ─────────────────────────────────────────────────────────────
+# Tool 5: Export (download Word/PDF file)
+# ─────────────────────────────────────────────────────────────
+
+@tool
+def export_tool(format: str = "docx") -> str:
+    """Xuất file tài liệu đã upload hoặc đã chỉnh sửa dưới dạng Word hoặc PDF để tải về.
+    Dùng tool này khi người dùng yêu cầu xuất file, tải file, download, convert sang word/pdf.
+    Tham số format: 'docx' cho file Word, 'pdf' cho file PDF. Mặc định là 'docx'."""
+    
+    req_docs = current_request_doc_ids.get()
+    doc_ids = req_docs if req_docs is not None else get_all_doc_ids()
+    
+    if not doc_ids:
+        return "Chưa có tài liệu nào được chỉ định để xuất. Vui lòng tải lên tài liệu trước."
+    
+    # Use the most recently uploaded document
+    doc_id = doc_ids[-1]
+    doc_info = get_doc_info(doc_id)
+    
+    if not doc_info:
+        return "Không tìm thấy thông tin tài liệu."
+    
+    docx_path = doc_info.get("docx_path", "")
+    file_name = doc_info.get("file_name", "document")
+    
+    if not docx_path:
+        return "Không tìm thấy file DOCX của tài liệu này."
+    
+    from pathlib import Path
+    from llm_pipeline import exporter
+    
+    output_dir = Path(docx_path).parent.parent / "outputs"
+    output_dir.mkdir(parents=True, exist_ok=True)
+    
+    # Check if there's a revised version available
+    revised_path = output_dir / f"{Path(docx_path).stem}_Revised.docx"
+    source_path = str(revised_path) if revised_path.exists() else docx_path
+    source_name = Path(source_path).stem
+    
+    format_lower = format.strip().lower()
+    
+    if format_lower == "pdf":
+        # Export as PDF
+        pdf_filename = f"{source_name}.pdf"
+        result = exporter.export_pdf(source_path, str(output_dir), pdf_filename)
+        if result:
+            return f"✓ Đã xuất file PDF thành công. File: {result}"
+        else:
+            return "Lỗi: Không thể xuất file PDF. Cần cài đặt MS Word hoặc LibreOffice."
+    else:
+        # Export as DOCX (copy to outputs)
+        docx_filename = f"{source_name}_Export.docx"
+        result = exporter.export_docx(source_path, str(output_dir), docx_filename)
+        return f"✓ Đã xuất file Word thành công. File: {result}"
+
+
 def get_all_tools() -> list:
     """Return all tools for agent registration."""
-    return [chat_tool, compare_tool, edit_tool, batch_rewrite_tool]
+    return [chat_tool, compare_tool, edit_tool, batch_rewrite_tool, export_tool]

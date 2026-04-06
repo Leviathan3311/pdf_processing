@@ -250,11 +250,12 @@ def apply_modifications(
     if isinstance(modifications, str):
         modifications = json.loads(modifications)
 
+    action = modifications.get("action", "modify_elements")
     mods_list = modifications.get("modifications", [])
-    if not mods_list:
+    if action == "modify_elements" and not mods_list:
         raise ValueError("No modifications provided.")
 
-    print(f"[Doc Surgery] Applying {len(mods_list)} modifications to {docx_path.name}...")
+    print(f"[Doc Surgery] Applying {action} to {docx_path.name}...")
 
     # Output path
     if output_dir is None:
@@ -291,50 +292,170 @@ def apply_modifications(
 
         paragraphs = _get_body_paragraphs(root)
         tables     = _get_body_tables(root)
+        body       = root.find(f'{{{WORD_NS}}}body')
 
-        for mod in mods_list:
-            element_id = mod.get("id", "")
-            new_text   = mod.get("new_text", "")
-
-            try:
-                if element_id.startswith("Para_"):
-                    para_idx = int(element_id.split("_")[1])
-                    if para_idx < len(paragraphs):
-                        _modify_paragraph_xml(paragraphs[para_idx], new_text)
-                        applied += 1
-                        print(f"  ✓ Modified {element_id}")
-                    else:
-                        errors.append(
-                            f"Paragraph index {para_idx} out of range "
-                            f"(max: {len(paragraphs) - 1})"
-                        )
-
-                elif element_id.startswith("Table_") and "_Cell_" in element_id:
-                    parts     = element_id.split("_")
-                    table_idx = int(parts[1])
-                    row_idx   = int(parts[3])
-                    col_idx   = int(parts[4])
-
-                    if table_idx < len(tables):
-                        cell = _get_table_cell(tables[table_idx], row_idx, col_idx)
-                        if cell is not None:
-                            cell_paras = cell.findall(f'{{{WORD_NS}}}p')
-                            if cell_paras:
-                                _modify_paragraph_xml(cell_paras[0], new_text)
-                            applied += 1
-                            print(f"  ✓ Modified {element_id}")
+        if action == "replace_body":
+            content_eids   = modifications.get("content_eids", [])
+            new_paragraphs = modifications.get("new_paragraphs", [])
+            
+            to_remove_elems = []
+            
+            # Find elements to remove
+            for eid in content_eids:
+                if eid.startswith("Para_"):
+                    try:
+                        idx = int(eid.split("_")[1])
+                        if idx < len(paragraphs):
+                            p_elem = paragraphs[idx]
+                            if p_elem not in to_remove_elems:
+                                to_remove_elems.append(p_elem)
+                    except Exception:
+                        pass
+                elif eid.startswith("Table_"):
+                    try:
+                        table_idx = int(eid.split("_")[1])
+                        if table_idx < len(tables):
+                            t_elem = tables[table_idx]
+                            if t_elem not in to_remove_elems:
+                                to_remove_elems.append(t_elem)
+                    except Exception:
+                        pass
+                        
+            if to_remove_elems:
+                # 1. Pick a normal template paragraph (avoid bold titles/headers).
+                # We do this by finding the paragraph in to_remove_elems containing the most text length.
+                template_p = None
+                max_len = -1
+                for elem in to_remove_elems:
+                    if etree.QName(elem.tag).localname == 'p':
+                        txt = "".join(t.text or "" for t in elem.findall(f'.//{{{WORD_NS}}}t'))
+                        if len(txt) > max_len:
+                            max_len = len(txt)
+                            template_p = elem
+                
+                # Fallback sequentially if nothing found
+                if template_p is None and paragraphs:
+                    template_p = paragraphs[0] if paragraphs else None
+                    
+                if template_p is not None:
+                    # 2. To avoid leaving empty formatted paragraphs, page breaks, etc. behind
+                    # we must wipe ALL DOM children between the first and last mapped element
+                    first_elem = to_remove_elems[0]
+                    last_elem = to_remove_elems[-1]
+                    
+                    try:
+                        start_idx = body.index(first_elem)
+                        end_idx = body.index(last_elem)
+                        
+                        if start_idx <= end_idx:
+                            # Safely collect children to remove
+                            children_to_remove = [body[i] for i in range(start_idx, end_idx + 1)]
+                            
+                            for child in children_to_remove:
+                                body.remove(child)
+                                applied += 1
+                                
+                            insert_idx = start_idx
                         else:
-                            errors.append(f"Table cell ({row_idx}, {col_idx}) not found")
-                    else:
-                        errors.append(
-                            f"Table index {table_idx} out of range "
-                            f"(max: {len(tables) - 1})"
-                        )
+                            raise ValueError("Reverse indices")
+                    except ValueError:
+                        # Fallback: Just remove the mapped items sparsely
+                        insert_idx = -1
+                        if first_elem.getparent() == body:
+                            insert_idx = body.index(first_elem)
+                            
+                        for elem in to_remove_elems:
+                            if elem.getparent() is not None:
+                                elem.getparent().remove(elem)
+                                applied += 1
+                                
+                        if insert_idx == -1:
+                            insert_idx = 0
+                            
+                    # Insert new paragraphs
+                    import copy
+                    for i, text in enumerate(new_paragraphs):
+                        new_p = copy.deepcopy(template_p)
+                        segs = _collect_text_segments(new_p)
+                        if segs:
+                            _set_t_text(segs[0][0], text)
+                            for seg in segs[1:]:
+                                _set_t_text(seg[0], '')
+                        else:
+                            rs = new_p.findall(f'{{{WORD_NS}}}r')
+                            if rs:
+                                r = rs[0]
+                            else:
+                                r = etree.SubElement(new_p, f'{{{WORD_NS}}}r')
+                            t = etree.SubElement(r, f'{{{WORD_NS}}}t')
+                            _set_t_text(t, text)
+                        body.insert(insert_idx + i, new_p)
+                        applied += 1
+                        
+                    print(f"  ✓ Replaced body: wiped {applied - len(new_paragraphs)} elems, inserted {len(new_paragraphs)} paras")
                 else:
-                    errors.append(f"Unknown element ID format: {element_id}")
-
-            except Exception as e:
-                errors.append(f"Error modifying {element_id}: {str(e)}")
+                    errors.append("Could not find a valid template paragraph clone")
+            else:
+                errors.append("No matched content elements to remove")
+                
+        else:
+            for mod in mods_list:
+                element_id = mod.get("id", "")
+                new_text   = mod.get("new_text", "")
+    
+                try:
+                    if element_id.startswith("Para_"):
+                        para_idx = int(element_id.split("_")[1])
+                        if para_idx < len(paragraphs):
+                            p_elem = paragraphs[para_idx]
+                            if new_text == "__DELETE__":
+                                parent = p_elem.getparent()
+                                if parent is not None:
+                                    parent.remove(p_elem)
+                                applied += 1
+                                print(f"  ✓ Deleted {element_id}")
+                            else:
+                                _modify_paragraph_xml(p_elem, new_text)
+                                applied += 1
+                                print(f"  ✓ Modified {element_id}")
+                        else:
+                            errors.append(
+                                f"Paragraph index {para_idx} out of range "
+                                f"(max: {len(paragraphs) - 1})"
+                            )
+    
+                    elif element_id.startswith("Table_") and "_Cell_" in element_id:
+                        parts     = element_id.split("_")
+                        table_idx = int(parts[1])
+                        row_idx   = int(parts[3])
+                        col_idx   = int(parts[4])
+    
+                        if table_idx < len(tables):
+                            cell = _get_table_cell(tables[table_idx], row_idx, col_idx)
+                            if cell is not None:
+                                cell_paras = cell.findall(f'{{{WORD_NS}}}p')
+                                if cell_paras:
+                                    if new_text == "__DELETE__":
+                                        for p in cell_paras:
+                                            _modify_paragraph_xml(p, "")
+                                    else:
+                                        _modify_paragraph_xml(cell_paras[0], new_text)
+                                        for p in cell_paras[1:]:
+                                            _modify_paragraph_xml(p, "")
+                                applied += 1
+                                print(f"  ✓ Modified {element_id}")
+                            else:
+                                errors.append(f"Table cell ({row_idx}, {col_idx}) not found")
+                        else:
+                            errors.append(
+                                f"Table index {table_idx} out of range "
+                                f"(max: {len(tables) - 1})"
+                            )
+                    else:
+                        errors.append(f"Unknown element ID format: {element_id}")
+    
+                except Exception as e:
+                    errors.append(f"Error modifying {element_id}: {str(e)}")
 
         # ── Serialise modified XML — namespace-safe ────────────────────────
         #

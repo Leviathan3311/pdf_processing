@@ -92,6 +92,7 @@ _DOCUMENT_PATTERNS = [
     r"\b(docx|pdf|xlsx|doc)\b",
     r"\b(bảng|điều khoản|điều kiện|giá|số liệu|thông tin trong|nội dung)\b",
     r"\b(summarize|summary|compare|extract|modify|rewrite)\b",
+    r"\b(xuất|export|download|tải về|tải xuống|convert|chuyển đổi|theo mẫu|viết lại)\b",
 ]
 
 _DOCUMENT_REGEX = re.compile(
@@ -313,8 +314,13 @@ def run_agent(query: str, tools: list, max_steps: int = 3, session_id: str = "de
 KHI NÀO GỌI TOOL:
 - Dùng `chat_tool` khi người dùng hỏi nội dung, yêu cầu tóm tắt, lập bảng, trích xuất, thống kê thông tin từ tài liệu đã upload.
 - Dùng `compare_tool` khi người dùng yêu cầu so sánh 2 tài liệu.
-- Dùng `edit_tool` khi người dùng yêu cầu sửa một điểm cụ thể trong tài liệu.
-- Dùng `batch_rewrite_tool` khi người dùng yêu cầu viết lại TOÀN BỘ tài liệu. Truyền toàn bộ thông tin tổng hợp vào tham số `context`.
+- Dùng `edit_tool` khi người dùng yêu cầu sửa MỘT ĐIỂM CỤ THỂ trong tài liệu (ví dụ: đổi giá, sửa tên).
+- Dùng `batch_rewrite_tool` khi:
+  * Người dùng yêu cầu viết lại TOÀN BỘ tài liệu.
+  * Người dùng yêu cầu "xuất nội dung theo mẫu" hoặc "sửa document theo tóm tắt".
+  * Người dùng đã tóm tắt trước đó và bây giờ muốn áp dụng vào file mẫu.
+  * Lưu ý: context sẽ được hệ thống tự động lấy từ lịch sử, bạn có thể để trống tham số `context`.
+- Dùng `export_tool` khi người dùng yêu cầu xuất file, tải file, download file, hoặc convert sang Word/PDF.
 
 KHI NÀO KHÔNG CẦN GỌI TOOL:
 - Câu hỏi về khả năng của bạn, hướng dẫn sử dụng → trả lời thẳng.
@@ -326,6 +332,8 @@ QUY TẮC BẮT BUỘC:
    - NẾU chưa có yêu cầu nào → hỏi người dùng muốn làm gì với tài liệu vừa tải lên.
 2. NẾU người dùng yêu cầu thao tác trên tài liệu nhưng "Tài liệu hiện có" đang là "Chưa có tài liệu nào." → Báo lỗi thân thiện và hướng dẫn upload.
 3. TUYỆT ĐỐI KHÔNG được chỉ mô tả "tôi sẽ gọi tool" hay "tôi cần gọi tool" — bạn PHẢI thực sự gọi tool ngay lập tức. Không hỏi lại, không giải thích trước, HÃY GỌI TOOL NGAY.
+4. Khi người dùng nói "xuất theo mẫu", "sửa theo tóm tắt", "viết lại theo nội dung đã tóm tắt" → LUÔN gọi `batch_rewrite_tool`.
+5. Khi người dùng nói "xuất word", "xuất pdf", "tải file", "download" → LUÔN gọi `export_tool`.
 
 Khi trả lời dạng bảng thống kê, dùng format bảng Markdown (| và ---).
 Luôn trả lời bằng tiếng Việt, rõ ràng, ngắn gọn."""
@@ -337,9 +345,35 @@ Luôn trả lời bằng tiếng Việt, rõ ràng, ngắn gọn."""
     
     # Append the last N history messages to prevent context overflow (e.g. max 10 turns)
     messages.extend(_session_histories[session_id][-20:])
-    
-    # Append the current augmented query
-    messages.append({"role": "user", "content": query})
+
+    # ── Context injection: if the user is asking to rewrite/export based on a
+    # previous summary, embed that summary directly into the query so the agent
+    # (and ultimately batch_rewrite_tool) receives it even if it forgets to pass
+    # context= correctly.  This is the most robust fix for the "viết sai" bug.
+    _REWRITE_REF_PATTERNS = re.compile(
+        r"(dựa vào tóm tắt|theo tóm tắt|viết lại theo|xuất theo mẫu|"
+        r"sửa theo tóm tắt|dựa trên tóm tắt|dựa vào nội dung.*tóm tắt|"
+        r"theo nội dung.*đã tóm tắt|dựa vào kết quả|theo kết quả tóm tắt)",
+        re.IGNORECASE | re.UNICODE,
+    )
+    text_for_pattern_check = raw_user_message if raw_user_message else query
+    if _REWRITE_REF_PATTERNS.search(text_for_pattern_check):
+        from llm_pipeline import tools as _tools_module
+        saved_ctx = _tools_module.get_session_context(session_id, most_recent_only=True)
+        if saved_ctx:
+            injected_query = (
+                f"{query}\n\n"
+                f"[HỆ THỐNG - Context từ tóm tắt trước đó, dùng cho batch_rewrite_tool]:\n"
+                f"{saved_ctx}"
+            )
+            print(f"[run_agent] 📌 Injected session context into query ({len(saved_ctx)} chars)")
+        else:
+            injected_query = query
+    else:
+        injected_query = query
+
+    # Append the current (possibly context-injected) query
+    messages.append({"role": "user", "content": injected_query})
     
     from pathlib import Path
     generated_files = []
@@ -396,11 +430,18 @@ Luôn trả lời bằng tiếng Việt, rõ ràng, ngắn gọn."""
                     # Invoke actual tool
                     tool_result = str(tool_map[tool_name].invoke(tool_args))
                     
-                    # Track files
-                    if "_Revised.docx" in tool_result:
-                        m = re.search(r'[\w\-./\\, ]+_Revised\.docx', tool_result)
+                    # Track files (Revised, Exported, PDF)
+                    file_patterns = [
+                        r'[\w\-./\\, ]+_Revised\.docx',
+                        r'[\w\-./\\, ]+_Export\.docx',
+                        r'[\w\-./\\, ]+\.pdf',
+                    ]
+                    for pat in file_patterns:
+                        m = re.search(pat, tool_result)
                         if m:
-                            generated_files.append(Path(m.group()).name)
+                            fname = Path(m.group()).name
+                            if fname not in generated_files:
+                                generated_files.append(fname)
                             
                     # Provide observation back to model
                     messages.append({
@@ -436,18 +477,25 @@ Luôn trả lời bằng tiếng Việt, rõ ràng, ngắn gọn."""
                 elif mentioned_tool == "edit_tool":
                     tool_args = {"instruction": actual_query}
                 elif mentioned_tool == "batch_rewrite_tool":
+                    # Context will be auto-fetched from session by the tool itself
                     tool_args = {"instruction": actual_query, "context": ""}
+                elif mentioned_tool == "export_tool":
+                    # Detect format from user message
+                    fmt = "pdf" if "pdf" in actual_query.lower() else "docx"
+                    tool_args = {"format": fmt}
                 else:
                     tool_args = {"query": actual_query}
                 
                 try:
                     tool_result = str(tool_map[mentioned_tool].invoke(tool_args))
                     
-                    # Track files
-                    if "_Revised.docx" in tool_result:
-                        m = re.search(r'[\w\-./\\, ]+_Revised\.docx', tool_result)
+                    # Track files (Revised, Exported, PDF)
+                    for pat in [r'[\w\-./\\, ]+_Revised\.docx', r'[\w\-./\\, ]+_Export\.docx', r'[\w\-./\\, ]+\.pdf']:
+                        m = re.search(pat, tool_result)
                         if m:
-                            generated_files.append(Path(m.group()).name)
+                            fname = Path(m.group()).name
+                            if fname not in generated_files:
+                                generated_files.append(fname)
                     
                     messages.append({
                         "role": "tool",
