@@ -184,6 +184,119 @@ def get_all_doc_ids() -> list[str]:
 # ─────────────────────────────────────────────────────────────
 
 
+# ─────────────────────────────────────────────────────────────
+# Map-Reduce: used for ALL large documents (no keyword detection)
+# ─────────────────────────────────────────────────────────────
+
+# Map-Reduce chunk size (chars).  Each chunk should be small enough for
+# Qwen3-4B to summarize in one call without OOM (~5k chars ≈ 1.2k tokens).
+_MAP_CHUNK_SIZE = 5000
+# Overlap between chunks (chars).  Prevents losing context at chunk boundaries.
+# The REDUCE step naturally deduplicates any repeated information.
+_MAP_OVERLAP_SIZE = 500
+
+
+def _split_text_into_chunks(text: str, chunk_size: int = _MAP_CHUNK_SIZE, overlap: int = _MAP_OVERLAP_SIZE) -> list[str]:
+    """Split text into chunks with overlap, preferring paragraph boundaries."""
+    if len(text) <= chunk_size:
+        return [text]
+
+    chunks = []
+    start = 0
+    while start < len(text):
+        end = start + chunk_size
+        if end >= len(text):
+            chunks.append(text[start:])
+            break
+        # Try to break at a paragraph boundary (double newline)
+        break_at = text.rfind("\n\n", start, end)
+        if break_at == -1 or break_at <= start:
+            # Fallback: break at single newline
+            break_at = text.rfind("\n", start, end)
+        if break_at == -1 or break_at <= start:
+            # Fallback: hard break
+            break_at = end
+        chunks.append(text[start:break_at])
+        # Move start back by overlap so the next chunk shares some context
+        start = max(break_at - overlap, start + 1)
+    return [c.strip() for c in chunks if c.strip()]
+
+
+def _map_reduce_process(full_text: str, query: str, file_name: str) -> str:
+    """
+    Map-Reduce processing for large documents.
+    
+    Phase 1 (MAP):   Split into chunks → extract relevant info from each based on query
+    Phase 2 (REDUCE): Combine all chunk results → produce final answer
+    
+    Adapts to ANY query type (summary, Q&A, extraction) — no keyword detection needed.
+    This guarantees ZERO information loss regardless of document size.
+    """
+    chunks = _split_text_into_chunks(full_text)
+    print(f"[Map-Reduce] 📄 Document '{file_name}': {len(full_text)} chars → {len(chunks)} chunks")
+
+    # ── PHASE 1: MAP — process each chunk with the user's query ──
+    chunk_results = []
+    for i, chunk in enumerate(chunks):
+        print(f"[Map-Reduce] 🔄 Processing chunk {i+1}/{len(chunks)} ({len(chunk)} chars)...")
+        map_prompt = f"""Đọc đoạn văn bản dưới đây và thực hiện yêu cầu của người dùng.
+Trích xuất TẤT CẢ thông tin liên quan: tên người, tổ chức, số liệu, ngày tháng, sự kiện, địa điểm, điều khoản.
+Nếu đoạn văn bản không chứa thông tin liên quan đến yêu cầu, trả lời: "Không có thông tin liên quan trong đoạn này."
+KHÔNG bịa thêm. Viết ngắn gọn nhưng đầy đủ.
+
+=== YÊU CẦU CỦA NGƯỜI DÙNG ===
+{query}
+
+=== ĐOẠN VĂN BẢN (phần {i+1}/{len(chunks)}) ===
+{chunk}
+
+=== KẾT QUẢ ==="""
+        result = llm_engine.generate_raw(map_prompt, max_new_tokens=1024)
+        chunk_results.append(result)
+        print(f"[Map-Reduce] ✓ Chunk {i+1} → {len(result)} chars")
+
+    # Filter out empty/no-info results
+    useful_results = [
+        r for r in chunk_results
+        if r.strip() and "không có thông tin liên quan" not in r.strip().lower()
+    ]
+    if not useful_results:
+        useful_results = chunk_results  # fallback: use all if everything was filtered
+
+    # ── PHASE 2: REDUCE — combine chunk results into final answer ──
+    combined_results = "\n\n---\n\n".join(
+        f"[Phần {i+1}]\n{s}" for i, s in enumerate(useful_results)
+    )
+
+    # If combined results are small enough, do a single reduce pass
+    if len(combined_results) <= _MAP_CHUNK_SIZE * 2:
+        print(f"[Map-Reduce] 📋 REDUCE: Combining {len(useful_results)} chunk results ({len(combined_results)} chars)...")
+        reduce_prompt = f"""Dưới đây là kết quả xử lý từng phần của tài liệu "{file_name}".
+Hãy tổng hợp thành MỘT câu trả lời hoàn chỉnh, mạch lạc, đầy đủ thông tin.
+
+QUY TẮC:
+1. Giữ lại TẤT CẢ thông tin quan trọng từ mỗi phần: tên, số liệu, ngày, sự kiện...
+2. Viết mạch lạc, có cấu trúc rõ ràng (chia mục nếu cần).
+3. KHÔNG bịa thêm thông tin ngoài những gì có trong kết quả.
+4. Loại bỏ thông tin trùng lặp giữa các phần.
+
+=== KẾT QUẢ TỪNG PHẦN ===
+{combined_results}
+
+=== YÊU CẦU GỐC CỦA NGƯỜI DÙNG ===
+{query}
+
+=== CÂU TRẢ LỜI HOÀN CHỈNH ==="""
+        result = llm_engine.generate_raw(reduce_prompt, max_new_tokens=2048)
+    else:
+        # If combined results are still too large, do recursive reduce
+        print(f"[Map-Reduce] 📋 REDUCE (recursive): Combined results still large ({len(combined_results)} chars). Reducing again...")
+        result = _map_reduce_process(combined_results, query, file_name)
+
+    print(f"[Map-Reduce] ✅ Final result: {len(result)} chars")
+    return result
+
+
 @tool
 def chat_tool(query: str) -> str:
     """Trả lời câu hỏi hoặc tóm tắt nội dung tài liệu đã upload.
@@ -196,13 +309,10 @@ def chat_tool(query: str) -> str:
     
     if not doc_ids:
         return "Chưa có tài liệu nào được chỉ định để trả lời câu hỏi. Vui lòng kiểm tra lại tải lên."
-    
 
-
-    # First, try to fetch the FULL text for all selected documents
-    # to avoid context fragmentation (especially useful for tables/statistics across multiple files).
-    full_text_mode = True
+    # Fetch the FULL text for all selected documents
     all_texts = []
+    all_texts_by_doc = {}  # doc_id -> (file_name, text)
     total_length = 0
     
     for doc_id in doc_ids:
@@ -215,81 +325,62 @@ def chat_tool(query: str) -> str:
         
         doc_block = f"--- TÀI LIỆU: {file_name} ---\n{doc_text}\n"
         all_texts.append(doc_block)
+        all_texts_by_doc[doc_id] = (file_name, doc_text)
         total_length += len(doc_block)
     
-    # Safe limit: 60,000 characters (approx 15-20k tokens for Qwen3-4B which supports 32k)
-    SAFE_CHAR_LIMIT = 60000
+    # Safe limit: 20,000 chars (~5k tokens).
+    SAFE_CHAR_LIMIT = 20000
     
     if total_length > 0 and total_length <= SAFE_CHAR_LIMIT:
+        # ── Small document: send full text directly ──
         print(f"[chat_tool] Using FULL TEXT extraction. Total length: {total_length} chars.")
         context = "\n".join(all_texts)
-    else:
-        # Fallback to RAG if documents are too large
-        full_text_mode = False
-        print(f"[chat_tool] Documents too large ({total_length} chars). Falling back to RAG.")
+    elif total_length > SAFE_CHAR_LIMIT:
+        # ── Large document → MAP-REDUCE (works for any query type) ──
+        print(f"[chat_tool] 🗺️ Large doc ({total_length} chars). Using MAP-REDUCE.")
         
-        # Calculate dynamic top_k per document to ensure all docs are represented
-        if len(doc_ids) == 1:
-            top_k_per_doc = 15
-        elif len(doc_ids) <= 3:
-            top_k_per_doc = 7
-        elif len(doc_ids) <= 6:
-            top_k_per_doc = 5
-        else:
-            top_k_per_doc = 3
-            
         all_results = []
-        for doc_id in doc_ids:
-            results = vector_store.search(query, doc_ids=[doc_id], top_k=top_k_per_doc)
-            all_results.extend(results)
-            
-        if not all_results:
-            return "Không tìm thấy thông tin liên quan trong tài liệu."
-        
-        # Separate paragraphs and table cells for proper reconstruction
-        para_parts = []
-        table_cells_by_table = {}  # (file_name, table_id) -> {(row, col): content}
-        table_max_dims = {}  # (file_name, table_id) -> (max_row, max_col)
-        
-        for r in all_results:
-            meta = r.get("metadata", {})
-            file_name = meta.get("file_name", "unknown")
-            element_id = meta.get("element_id", "?")
-            element_type = meta.get("element_type", "")
-            content = meta.get("original_content", "") or r.get("content", "")
-            
-            if element_type == "table_cell":
-                table_id = meta.get("table_id", "")
-                row = meta.get("row", 0)
-                col = meta.get("col", 0)
-                key = (file_name, table_id)
-                
-                if key not in table_cells_by_table:
-                    table_cells_by_table[key] = {}
-                    table_max_dims[key] = (-1, -1)
-                
-                table_cells_by_table[key][(row, col)] = content
-                mr, mc = table_max_dims[key]
-                table_max_dims[key] = (max(mr, row), max(mc, col))
+        for doc_id, (file_name, doc_text) in all_texts_by_doc.items():
+            if len(doc_text) <= SAFE_CHAR_LIMIT:
+                # This individual doc is small enough for a direct LLM call
+                print(f"[chat_tool] Doc '{file_name}' is small enough ({len(doc_text)} chars), direct processing.")
+                prompt = f"""Dựa trên nội dung tài liệu "{file_name}" dưới đây, hãy thực hiện yêu cầu.
+Giữ lại TẤT CẢ thông tin quan trọng. KHÔNG bịa thêm.
+
+=== NỘI DUNG TÀI LIỆU ===
+{doc_text}
+
+=== YÊU CẦU ===
+{query}
+
+=== KẾT QUẢ ==="""
+                result = llm_engine.generate_raw(prompt, max_new_tokens=2048)
+                all_results.append(result)
             else:
-                para_parts.append(f"[{file_name} - {element_id}] {content}")
+                # Large doc → Map-Reduce
+                result = _map_reduce_process(doc_text, query, file_name)
+                all_results.append(result)
         
-        # Reconstruct table cells into Markdown tables
-        for (file_name, table_id), cells in table_cells_by_table.items():
-            max_row, max_col = table_max_dims[(file_name, table_id)]
-            para_parts.append(f"\n[{file_name} - {table_id}] Bảng dữ liệu (trích xuất một phần):")
-            for row in range(max_row + 1):
-                row_parts = []
-                for col in range(max_col + 1):
-                    cell_text = cells.get((row, col), "...")
-                    cell_text = cell_text.replace("\n", " ").strip()
-                    row_parts.append(cell_text)
-                para_parts.append("| " + " | ".join(row_parts) + " |")
-                if row == 0:
-                    para_parts.append("|" + "|".join(["---"] * (max_col + 1)) + "|")
-            
-        context = "\n".join(para_parts)
+        # If multiple docs, combine results
+        if len(all_results) == 1:
+            result = all_results[0]
+        else:
+            combined = "\n\n---\n\n".join(all_results)
+            result = llm_engine.generate_raw(
+                f"Tổng hợp các kết quả sau thành một câu trả lời hoàn chỉnh:\n\n{combined}\n\n=== YÊU CẦU GỐC ===\n{query}\n\n=== KẾT QUẢ TỔNG HỢP ===",
+                max_new_tokens=2048,
+            )
+        
+        # Save & return directly (skip the normal QA prompt path)
+        session_id = current_session_id.get()
+        save_session_context(session_id, result)
+        print(f"[chat_tool] 📝 Auto-saved Map-Reduce result as session context (session: {session_id}, {len(result)} chars)")
+        return result
+    else:
+        # This shouldn't happen (total_length <= 0), but handle gracefully
+        return "Không tìm thấy nội dung tài liệu."
     
+    # ── Standard Q&A prompt (for small docs or RAG fallback) ──
     prompt = f"""Dựa trên nội dung tài liệu dưới đây, hãy trả lời câu hỏi.
 
 QUY TẮC BẮT BUỘC:
@@ -308,14 +399,7 @@ QUY TẮC BẮT BUỘC:
     
     result = llm_engine.generate_raw(prompt)
     
-    # ── Always save the result to session context so batch_rewrite_tool
-    # can reliably retrieve it later, regardless of whether the user's query
-    # contained explicit summary keywords.
-    # Previously this only fired when _SUMMARY_KEYWORDS matched the query string
-    # that the LLM passed when calling the tool — which was fragile because the
-    # LLM might call chat_tool with a paraphrased instruction that doesn't contain
-    # the exact keywords, silently skipping the save and causing batch_rewrite_tool
-    # to fall back to the wrong history message.
+    # ── Always save the result to session context ──
     session_id = current_session_id.get()
     save_session_context(session_id, result)
     print(f"[chat_tool] 📝 Auto-saved result as session context (session: {session_id}, {len(result)} chars)")

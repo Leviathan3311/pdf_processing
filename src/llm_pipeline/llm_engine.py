@@ -545,7 +545,28 @@ def generate_raw(prompt: str, max_new_tokens: int = 4096) -> str:
     )
     
     inputs = tokenizer([text], return_tensors="pt").to(model.device)
-    
+
+    # ── Safety truncation: prevent CUDA OOM on long inputs ──
+    # Qwen3-4B 4-bit uses ~10.4 GiB; with 16 GiB GPU, only ~5 GiB remains for
+    # KV-cache.  Cap input at ~8192 tokens to stay safe (8192 + 4096 output = 12k).
+    MAX_INPUT_TOKENS = 8192
+    input_len = inputs.input_ids.shape[-1]
+    if input_len > MAX_INPUT_TOKENS:
+        print(f"[generate_raw] ⚠️ Input too long ({input_len} tokens). Truncating to {MAX_INPUT_TOKENS} tokens.")
+        # Keep the beginning (system prompt + instructions) and end (query/data tail)
+        keep_start = MAX_INPUT_TOKENS // 2
+        keep_end = MAX_INPUT_TOKENS - keep_start
+        inputs["input_ids"] = torch.cat([
+            inputs["input_ids"][:, :keep_start],
+            inputs["input_ids"][:, -keep_end:]
+        ], dim=1)
+        if "attention_mask" in inputs:
+            inputs["attention_mask"] = torch.cat([
+                inputs["attention_mask"][:, :keep_start],
+                inputs["attention_mask"][:, -keep_end:]
+            ], dim=1)
+        input_len = inputs["input_ids"].shape[-1]
+
     with torch.no_grad():
         generated_ids = model.generate(
             **inputs,
@@ -556,9 +577,11 @@ def generate_raw(prompt: str, max_new_tokens: int = 4096) -> str:
             do_sample=True,
         )
     
-    generated_ids_trimmed = generated_ids[0][inputs.input_ids.shape[-1]:]
+    generated_ids_trimmed = generated_ids[0][input_len:]
     response = tokenizer.decode(generated_ids_trimmed, skip_special_tokens=True)
-    
+
+    # Free tensors immediately
+    del inputs, generated_ids
     _safe_cuda_cleanup()
     return response.strip()
 
