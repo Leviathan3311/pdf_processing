@@ -1,0 +1,8 @@
+# Separate venv for MinerU (its torch / transformers pins must not clash with the main environment):
+#   python -m venv .venv-mineru
+#   .venv-mineru\Scripts\pip install -r requirements-mineru.txt
+#   .venv-mineru\Scripts\mineru-models-download
+# Tested on Windows 11, RTX 5070 Ti 16 GB (ONNX DirectML + llama.cpp VLM).
+mineru==4.2.3
+mineru-llama-cpp==0.2.3
+onnxruntime-directml==1.24.4

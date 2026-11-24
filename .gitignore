@@ -10,6 +10,8 @@ ENV/
 env.bak/
 venv.bak/
 .venv/
+.venv-*/
+models/
 
 # Environment variables
 .env
@@ -28,7 +30,7 @@ venv.bak/
 # Logs
 *.log
 
-# Model Weights (DocLayout-YOLO & Qwen)
+# Model weights (download them, see README)
 *.pt
 *.pth
 *.bin
@@ -51,6 +53,14 @@ test_frame_extracted/
 *.txt
 !requirements.txt
 !requirements_win.txt
+!requirements-mineru.txt
+
+# Test data (real documents with personal names: never commit)
+Testcase/
+samples/
+
+# Test / tool caches
+.pytest_cache/
 
 # Temp files
 tmp/

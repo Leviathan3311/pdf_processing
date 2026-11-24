@@ -1,142 +1,181 @@
-# PDF to DOCX Smart Converter
+# OCR → DOCX (MinerU)
 
-A complete pipeline to automatically analyze and convert PDF files (both Text-Based and Scanned) into fully formatted Microsoft Word Documents (DOCX).
+Convert **scanned images and PDFs** (scanned, digital or mixed) into **editable Word documents that keep the
+original layout**: fonts, sizes, bold / italic, colours, positions, real Word tables with merged cells, native
+Word equations, and seals / signatures as transparent overlays. Built and tuned for **Vietnamese** administrative
+documents.
 
-## 🚀 Features
-
-*   **Smart Auto-Detection**: Automatically classifies incoming PDFs as Text-Based, Scanned, or Hybrid.
-*   **Fast Extraction**: Uses `PyMuPDF` for lightning-fast, high-accuracy text extraction on native text-based PDFs.
-*   **Advanced OCR Pipeline**: Utilizes state-of-the-art AI for scanned document reconstruction:
-    *   **DocLayout YOLOv10**: Detects complex layouts, bounding boxes, tables, and images accurately.
-    *   **Qwen2.5-VL OCR**: Trình độ nhận diện chữ và format (in đậm, in nghiêng, danh sách, bảng biểu HTML) cao cấp từ ảnh scan. Nhỏ gọn và hỗ trợ tiếng Việt cực tốt.
-*   **Layout Preservation**: Maintains the original reading order and relative positions of paragraphs using absolute positioning in DOCX (Textboxes).
-*   **VRAM Optimized**: Supports 4-bit and 8-bit quantization (`bitsandbytes`) for Qwen2.5-VL on consumer GPUs.
-
-## 🛠 Prerequisites
-
-*   **OS:** Windows / Linux
-*   **Python:** 3.10+
-*   **GPU (Optional but recommended):** NVIDIA GPU (CUDA support) for running YOLO and OCR pipelines efficiently.
-
-## 📥 Installation
-
-1.  **Clone the repository or download the source code.**
-2.  **Install dependencies**:
-    ```bash
-    pip install -r requirements.txt
-    ```
-    *Note: Make sure you have PyTorch installed with CUDA support if you intend to use the GPU. Check `requirements.txt` for the correct PyTorch installation command.*
-
-3.  **Download Models**:
-    *   The project expects the YOLO model weights (e.g., `doclayout_yolo_docstructbench_imgsz1024.pt`) to be in the root directory.
-    *   **Qwen2.5-VL OCR Model**: The script uses `Qwen/Qwen2.5-VL-3B-Instruct` or a local version in `./Qwen2.5-VL-3B` by default. To download the current model locally, run:
-        ```bash
-        pip install -U "huggingface_hub[cli]"
-        huggingface-cli download Qwen/Qwen2.5-VL-3B-Instruct --local-dir Qwen2.5-VL-3B
-        ```
-
-## 💻 Usage
-
-### 🌟 1. Automatic Processing (Recommended)
-This script will analyze the PDF and automatically route it to the fastest/best conversion pipeline.
-
-```bash
-python src/pdf_processing/auto_process_pdf.py path/to/your/file.pdf
+```powershell
+python scripts\convert.py Testcase -o D:\ket_qua
 ```
 
-**Advanced Usage with OCR features for Scanned PDFs:**
-```bash
-python src/pdf_processing/auto_process_pdf.py path/to/your/file.pdf --output path/to/output.docx --enable_ocr --load_4bit
-```
-**Options:**
-*   `--output`, `-o`: Output DOCX file path (Optional).
-*   `--enable_ocr`: Force enable OCR processing (for scanned documents).
-*   `--dpi`: DPI for converting PDF pages to images (Default: 300).
-*   `--imgsz`: YOLO Image inference size (Default: 1024).
-*   `--conf`: YOLO layout detection confidence threshold (Default: 0.1).
-*   `--load_4bit`: Enable 4-bit quantization for the Qwen OCR model (Saves VRAM).
-*   `--load_8bit`: Enable 8-bit quantization for the Qwen OCR model.
+One command, batch-capable, writes only the `.docx` files.
 
 ---
 
-### 🔍 2. Check PDF Type Only
-If you just want to analyze whether a PDF is native text or scanned without converting it.
+## Highlights
 
-```bash
-python src/pdf_processing/check_pdf_type.py path/to/your/file.pdf
+| | |
+|---|---|
+| **Any input** | `jpg png webp tif bmp` and `pdf`; each PDF page is classified on its own (scan / text / formulas) |
+| **Accurate OCR** | MinerU `standard` (VLM) on images flattened, deskewed and upscaled to 3200 px |
+| **Vietnamese diacritics** | ProtonX T5 corrector, *constrained*: a change is kept only if the letters stay identical and only the accents differ; codes, numbers and names are locked |
+| **Layout fidelity** | font size, weight, slant and colour measured on the image; a closed loop renders through Microsoft Word and moves every paragraph onto its original position |
+| **Editable output** | text stays in the body flow (no text boxes), real `w:tbl` tables, OMML equations |
+| **Digital PDFs** | text, fonts, tables and images read straight from the PDF: exact, no GPU, milliseconds per page |
+
+## How it works
+
+```
+input (image / PDF)
+ ├─ PDF page classifier (PyMuPDF) ── text page ─────────► PyMuPDF extractor ───────────────┐
+ │                                   formulas ──► render ─┐                                │
+ │                                   scan ──────► render ─┤                                │
+ └─ image ───────────────────────────────────────────────┴► flatten · deskew · 3200 px    │
+                                                             ► MinerU standard (middle.json)│
+                                                             ► diacritic correction        │
+                                                             ► layout measured on image ───┤
+                                                                                           ▼
+                                                          DOCX renderer (python-docx + OMML)
+                                                                                           ▼
+                                             closed loop: Word → PDF → compare baselines → fix
+                                                                                           ▼
+                                                                                      .docx
 ```
 
-### 🧠 3. Test YOLO Layout Detection Only
-To test bounding box detection and save annotated images to a folder, you can run the YOLO diagnostic script.
+A batch shares every expensive start-up: MinerU loads once for all OCR pages while the spelling model loads in
+parallel; spelling runs in one GPU pass; each closed-loop pass exports all documents with one Word instance.
+A PDF with only text pages starts neither MinerU nor the spelling model.
 
-```bash
-python src/pdf_processing/yolo_detect.py path/to/your/file.pdf --output-dir my_tests
+## Requirements
+
+- Windows 10/11, Python 3.11
+- NVIDIA GPU recommended (tested: RTX 5070 Ti 16 GB); MinerU uses ONNX DirectML + llama.cpp
+- Microsoft Word (for the closed loop; not needed with `--passes 0`). Word also provides `MML2OMML.XSL`,
+  used to turn formulas into native equations
+
+## Installation
+
+```powershell
+git clone -b minerU https://github.com/Leviathan3311/pdf_processing.git
+cd pdf_processing
 ```
 
-## 🏗 Architecture & Code Structure
+**1. Main environment**
 
-*   `src/pdf_processing/auto_process_pdf.py`: The main entry point. Decides which pipeline to run based on PDF characteristics.
-*   `src/pdf_processing/check_pdf_type.py`: Script to analyze the text-to-page ratio of a PDF document.
-*   `src/pdf_processing/processs_pdf_to_docs.py`: The Heavyweight Pipeline. Contains the logic for YOLO detection -> Qwen OCR Extraction -> Coordinate Mapping -> DOCX Reconstruction.
-*   `src/pdf_processing/yolo_detect.py`: Diagnostics tool to visually preview the layout bounding boxes found by the YOLO model on your PDFs.
-
-## 📝 Notes
-*   **Text-Based Mode** focuses on speed and pure text extraction. It preserves text and basic reading order but drops complex layouts.
-*   **Scanned (OCR) Mode** attempts to perfectly rebuild the document page-by-page. It handles multi-column layouts and tables but requires significantly more processing time and hardware.
-
----
-
-## 🤖 LLM Document Intelligence Pipeline
-
-A LangChain Agent powered by **Qwen3-4B** that can analyze, compare, and modify documents while preserving original formatting.
-
-### Features
-*   **Q&A**: Ask questions about uploaded documents (RAG with ChromaDB + BGE-M3)
-*   **Compare**: Upload 2 documents and get a detailed comparison
-*   **Edit**: Request content modifications — LLM generates changes, applies them to the original `.docx` preserving format
-
-### Architecture
-```
-POST /chat → LangChain Agent (Qwen3-4B) → Auto-routes to:
-  ├── chat_tool   → RAG search → answer / summarize
-  ├── compare_tool → load 2 docs → diff
-  └── edit_tool   → JSON modifications → doc surgery → revised .docx
+```powershell
+python -m venv .venv
+.venv\Scripts\pip install -r requirements.txt
 ```
 
-### Setup
+**2. MinerU** (separate venv, so its dependency pins never clash with the main environment)
 
-1.  **Install new dependencies**:
-    ```bash
-    pip install -r requirements.txt
-    ```
+```powershell
+python -m venv .venv-mineru
+.venv-mineru\Scripts\pip install -r requirements-mineru.txt
+.venv-mineru\Scripts\mineru-models-download
+```
 
-2.  **Download Qwen3-4B model** (~8GB):
-    ```bash
-    huggingface-cli download Qwen/Qwen3-4B --local-dir Qwen3-4B
-    ```
+**3. Spelling model** (`protonx-models/protonx-legal-tc`, ~0.9 GB)
 
-3.  **Start the API**:
-    ```bash
-    uvicorn api.main:app --host 0.0.0.0 --port 8000
-    ```
-    API docs: http://localhost:8000/docs
+```powershell
+huggingface-cli download protonx-models/protonx-legal-tc --local-dir models/protonx-legal-tc
+```
 
-### API Endpoints
+Model weights are not stored in git (`models/` is ignored).
 
-| Method | Endpoint | Description |
-|--------|----------|-------------|
-| POST | `/documents/upload` | Upload Word/PDF |
-| GET | `/documents/` | List documents |
-| DELETE | `/documents/{doc_id}` | Delete document |
-| POST | `/chat` | Unified chat (Q&A, compare, edit) |
-| GET | `/download/{filename}` | Download revised files |
-| GET | `/health` | Health check |
+## Usage
 
-### Code Structure
-*   `src/llm_pipeline/document_parser.py`: Parse Word/PDF → structured elements with IDs
-*   `src/llm_pipeline/vector_store.py`: ChromaDB + BGE-M3 embedding management
-*   `src/llm_pipeline/llm_engine.py`: Load Qwen3-4B + LangChain Agent
-*   `src/llm_pipeline/tools.py`: 3 LangChain Tools (chat, compare, edit)
-*   `src/llm_pipeline/doc_surgery.py`: Apply JSON modifications to .docx preserving format
-*   `api/main.py`: FastAPI entry point
-*   `api/routes/`: API route handlers
+```powershell
+$env:PYTHONUTF8 = "1"
+
+# every image / PDF in a folder → D:\ket_qua\<name>.docx
+python scripts\convert.py Testcase -o D:\ket_qua
+
+# several files
+python scripts\convert.py scan.jpg report.pdf -o D:\ket_qua
+
+# one file → exactly this path
+python scripts\convert.py cong_van.pdf -o D:\ket_qua\cong_van.docx
+```
+
+| Option | Default | Meaning |
+|---|---|---|
+| `-o, --out` | required | output folder, or a `.docx` path for a single input |
+| `--passes` | `2` | closed-loop passes through Word: `2` most exact, `1` faster, `0` no Word |
+| `--keep-work DIR` | off | keep intermediates and side-by-side `debug/*.compare.png` images |
+| `--long-edge` | `3200` | OCR image size (px); 3200 measured best |
+| `--model` | `models/protonx-legal-tc` | spelling model folder |
+| `--mineru-python` | `.venv-mineru\Scripts\python.exe` | interpreter of the MinerU venv |
+
+The run ends with a report per file: page kinds, diacritic fixes, Word page count, mean vertical offset from the
+original (pt). A `<name>.gt.txt` next to an input adds its character error rate (CER) before / after correction.
+
+## Results
+
+Batch of 14 files / 17 pages (10 images, 4 scanned PDF pages, 3 digital PDF pages), `--passes 2`:
+**all converted, 114 s total**, every document on its original page count.
+
+| Input | Mean vertical offset |
+|---|---|
+| Digital PDF (Word export: letterhead, justified text, merged-cell table) | 0.1 pt |
+| PDF with formulas (equations become native Word equations) | 0.1 pt |
+| Clean scans and screenshots | 0.0 – 3.2 pt |
+| Phone photos, faint or curled pages | 1.5 – 6 pt |
+| Real 2-page scanned PDF with seal and signature | 8.9 pt |
+
+Diacritic correction on a scanned official letter: word errors 18 → 8. Full measurements: [`PROGRESS.md`](PROGRESS.md).
+
+## Project structure
+
+```
+src/conversion/
+  pipeline.py           batch orchestration (input → OCR → spelling → layout → closed loop)
+  page_classifier.py    per-page PDF kind: scan / text_complex / text_simple
+  pymupdf_extractor.py  digital PDF pages → layout, straight from the text layer
+  preprocess.py         background flattening, deskew, upscale; PDF page rendering
+  spelling.py           constrained Vietnamese diacritic correction
+  measure.py            typography measured on the image (lines, size, bold, italic, colour)
+  layout.py             MinerU middle.json + image → positioned paragraphs, tables, floats (XY-cut)
+  docx_renderer.py      layout → editable DOCX
+  math_omml.py          LaTeX → MathML → Word OMML
+  fit_check.py          closed-loop position correction
+  word_export.py        DOCX → PDF through Word (one instance per batch)
+scripts/
+  convert.py            command-line entry point
+  mineru_parse.py       MinerU runner (runs in .venv-mineru)
+  render_layout.py      re-run only the layout step on a kept work folder
+  eval_ocr.py           character error rate against hand-typed ground truth
+  bench_llm.py          benchmark a spelling / LLM model
+  spike_mineru.py       compare MinerU tiers
+tests/                  unit tests (no models, no Word needed)
+CLAUDE.md               design document (decisions, thresholds, rationale)
+PROGRESS.md             measurements and status log
+```
+
+## Development
+
+```powershell
+python -m pytest tests -q                                      # unit tests
+python scripts\convert.py Testcase -o out --keep-work work      # once
+python scripts\render_layout.py work                            # iterate on layout without re-running OCR
+python scripts\eval_ocr.py Testcase                             # CER (needs <name>.gt.txt)
+```
+
+Layout thresholds are always **relative to the page itself** (median gap, the page's ink colour, letter height
+without diacritics, MinerU block type), never tuned to one sample; every change is re-run on the whole sample set.
+Sample documents contain real personal data: keep them in `Testcase/` (git-ignored), never commit them.
+
+## Limitations
+
+- Bold / italic is measured per line, not per word: an italic phrase inside a paragraph is not reproduced.
+- Handwriting is kept as an image; handwritten digits inside a printed line can enlarge that line.
+- Digital PDFs: vector graphics other than thin rules (charts, diagrams) and rotated text are not yet carried over.
+- PDF pages with formulas go through OCR (MinerU `flash` on the text layer is not wired yet).
+- Windows only for now (Word COM for the closed loop, DirectML for MinerU).
+
+## License
+
+Code: [Apache 2.0](LICENSE). Third-party models keep their own licenses: MinerU — *MinerU Open Source License*;
+`protonx-models/protonx-legal-tc` — **non-commercial** (for commercial use, swap in an Apache-2.0 corrector such as
+`nrl-ai/vn-spell-correction-base` via `--model`).
