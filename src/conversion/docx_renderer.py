@@ -8,6 +8,7 @@
 from __future__ import annotations
 
 import copy
+import dataclasses
 from pathlib import Path
 
 from docx import Document
@@ -19,7 +20,7 @@ from docx.oxml.ns import nsdecls, qn
 from docx.shared import Emu, Pt, RGBColor
 from lxml import html as lh
 
-from .layout import HSplit, Page, Para, TableItem, VStack, node_bottom, node_top, xy_cut
+from .layout import HSplit, Page, Para, TableItem, VStack, node_bottom, node_top, typeset_width, xy_cut
 
 ALIGN = {"left": WD_ALIGN_PARAGRAPH.LEFT, "center": WD_ALIGN_PARAGRAPH.CENTER,
          "right": WD_ALIGN_PARAGRAPH.RIGHT, "justify": WD_ALIGN_PARAGRAPH.JUSTIFY}
@@ -39,13 +40,16 @@ def _set_fonts(run, name: str) -> None:
         fonts.set(qn(attr), name)
 
 
-def _format_para(p, *, left=0.0, right=0.0, first=0.0, before=0.0, line=None, align="left", outline=None):
+def _format_para(p, *, left=0.0, right=0.0, first=0.0, before=0.0, line=None, align="left", outline=None,
+                 at_least=False):
     pf = p.paragraph_format
     pf.left_indent, pf.right_indent = Pt(max(0.0, left)), Pt(max(0.0, right))
     pf.first_line_indent = Pt(first)
     pf.space_before, pf.space_after = Pt(max(0.0, before)), Pt(0)
     if line:
-        pf.line_spacing_rule = WD_LINE_SPACING.EXACTLY
+        # exact keeps measured line pitch; a matrix / stacked fraction would be clipped by it, so such a line
+        # only sets a minimum and Word grows it to the formula
+        pf.line_spacing_rule = WD_LINE_SPACING.AT_LEAST if at_least else WD_LINE_SPACING.EXACTLY
         pf.line_spacing = Pt(line)
     pf.alignment = ALIGN[align]
     pf.widow_control = False
@@ -67,17 +71,13 @@ def _add_run(p, text, typo):
     return run
 
 
-def _line_width(runs) -> float:
-    """Typeset width (pt) of one line of runs: Times New Roman text, Cambria Math formulas."""
-    from .math_omml import width_em
-    from .measure import text_width_pt
-    total = 0.0
-    for r in runs:
-        if r.latex:
-            total += width_em(r.latex) * r.typo.size
-        else:
-            total += text_width_pt(r.text, r.typo.size, r.typo.font, r.typo.bold, r.typo.italic)
-    return total
+def _shrunk(line, k: float):
+    """The line's runs set k times smaller (whole half points, never larger)."""
+    out = []
+    for r in line:
+        size = max(1.0, int(r.typo.size * k * 2) / 2)
+        out.append(dataclasses.replace(r, typo=dataclasses.replace(r.typo, size=size)))
+    return out
 
 
 def _add_math(p, run) -> None:
@@ -182,7 +182,10 @@ def _render_para(container, para: Para, cx0: float, cx1: float, before: float, f
                 lx0, lx1 = para.line_x[i] if para.line_x else (para.x0, para.x1)   # width error splits evenly
                 # a standalone line must never wrap: widen the box when the text needs more room than was
                 # measured (part of the line hidden under a seal, faint print)
-                need = _line_width(line) * 1.04
+                need = typeset_width(line) * 1.04
+                if need > cx1 - cx0:                       # the column is narrower than the typeset line:
+                    line = _shrunk(line, (cx1 - cx0) / need)   # smaller type rather than a wrapped line
+                    need = typeset_width(line) * 1.04
                 line_slack = max(0.06 * (lx1 - lx0) + 4.0, (need - (lx1 - lx0)) / 2 + 2.0)
                 left, right, align = lx0 - cx0 - line_slack, cx1 - lx1 - line_slack, "center"
                 if left < 0:                               # keep the widened box inside the column
@@ -190,7 +193,8 @@ def _render_para(container, para: Para, cx0: float, cx1: float, before: float, f
                 if right < 0:
                     left, right = max(0.0, left + right), 0.0
             _format_para(p, left=left, right=right, before=before if i == 0 else 0.0,
-                         line=para.line_height, align=align, outline=para.outline if i == 0 else None)
+                         line=para.line_height, align=align, outline=para.outline if i == 0 else None,
+                         at_least=para.stack > 1.5)
             for x in para.tab_stops:                       # Word tab positions count from the column start
                 p.paragraph_format.tab_stops.add_tab_stop(Pt(x - cx0))
         for r in line:
@@ -269,12 +273,14 @@ def _render_node(container, node, cx0: float, cx1: float, top: float, first_p=No
             pending_after = _render_para(container, kid, cx0, cx1, gap, first_p)
             first_p = None
         else:
-            if gap > 0.5:
+            if first_p is not None:          # a cell's own first paragraph sits above anything added to the cell:
+                _format_para(first_p, line=max(gap, 1.0))   # use it as the gap now, never for a later paragraph
+                first_p = None
+            elif gap > 0.5:
                 if pending_after is not None:
                     pending_after.paragraph_format.space_after = Pt(gap)
                 else:
-                    _spacer(container, gap) if first_p is None else _format_para(first_p, line=gap)
-                    first_p = None
+                    _spacer(container, gap)
             if isinstance(kid, TableItem):
                 _render_table(container, kid, cx0, cx1)
             else:

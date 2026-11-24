@@ -137,3 +137,46 @@ def test_rendered_docx_is_editable_flow(tmp_path):
     assert "txbxContent" not in xml                    # text never in text boxes
     assert "Căn cứ văn bản" in xml and "Tham gia" in xml
     assert xml.count("<w:tbl>") == 2                   # letterhead split + real table
+
+
+MATRIX = r"A = \left[ \begin{array}{l l} 2 & 0 \\ 0 & 2 \\ 1 & 0 \end{array} \right]"
+
+
+def test_matrix_is_tall_and_measured_per_column():
+    from conversion.math_omml import height_em, width_em
+    assert height_em(MATRIX) > 3.0 and height_em("e^{x} + 1") < 1.5
+    assert height_em(r"\hat{a} + \underline{vd}") < 1.5         # accents are not stacked rows
+    assert width_em(MATRIX) < width_em("A = [2 0 0 2 1 0]") + 2.0   # widest cell per column, not every cell
+
+
+def test_matrix_brackets_become_a_stretching_word_delimiter():
+    from lxml import etree
+    from conversion.math_omml import latex_to_omml
+    xml = etree.tostring(latex_to_omml(MATRIX, 12)).decode()
+    assert "<m:d>" in xml or "<m:d " in xml                       # m:d grows with the 3 rows
+    assert "<m:m>" in xml or "<m:m " in xml
+
+
+def test_ink_reference_ignores_background_outside_text():
+    from conversion.measure import ink_reference, is_pen_page
+    img = np.full((400, 400, 3), 255, np.uint8)
+    img[:, :60] = (120, 80, 40)                                    # brown table top beside the sheet
+    for y in range(120, 300, 30):                                  # blue pen lines on the sheet
+        img[y:y + 6, 100:360] = (40, 50, 140)
+    gray = cv2.cvtColor(img, cv2.COLOR_RGB2GRAY)
+    ref = ink_reference(img, gray, [(90, 110, 370, 310)])
+    assert ref[2] > 0 > ref[0]                                     # blue, not the brown background
+    assert is_pen_page(ref)
+    black = np.full_like(img, 255)
+    black[150:160, 100:360] = 20
+    assert not is_pen_page(ink_reference(black, cv2.cvtColor(black, cv2.COLOR_RGB2GRAY), [(90, 140, 370, 170)]))
+
+
+def test_paragraph_after_a_nested_split_stays_below_it(tmp_path):
+    # column 1 of a band = [two-column sub-band, then a line]: the line must come after the sub-band
+    top_l, top_r = _para(70, 140, 40, "Ta dang co"), _para(150, 300, 40, "Score")
+    below = _para(70, 230, 90, "Chia tung phan tu")
+    side = Para(330, 560, [[Run("Scale", Typo(size=12))], [Run("why", Typo(size=12))]], [40, 90], 14.0)
+    out = render_pages([Page(595.3, 841.9, [top_l, top_r, below, side])], tmp_path / "n.docx")
+    xml = zipfile.ZipFile(out).read("word/document.xml").decode("utf-8")
+    assert xml.index("Score") < xml.index("Chia tung phan tu")

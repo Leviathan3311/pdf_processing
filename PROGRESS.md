@@ -252,6 +252,23 @@ Còn hạn chế: chưa có kiểu chữ trong đoạn (cụm nghiêng / đậm)
 ("687") làm dòng "Số:" to hơn bản gốc; ô bảng gộp trong PDF chữ căn giữa dọc thay vì căn trên; hình vẽ vector
 (biểu đồ) trong PDF chữ chưa được giữ (chỉ đường kẻ mảnh); chữ xoay trong PDF chữ bị bỏ.
 
+### Trang viết tay toàn bộ (2026-11-24) — 3 ảnh chụp vở ghi Transformer (229a…, 5acb…, 76ac…)
+Trước: DOCX **toàn ảnh** (229: 0 ký tự, 40 ảnh, 5 MB). Nguyên nhân: màu mực chuẩn của trang tính trên mọi điểm tối của
+ảnh, gồm cả **mặt bàn gỗ** quanh tờ giấy → màu chuẩn = nâu cam → mọi nét bút xanh lệch ≥ 16 → "mực màu / chữ ký" → ảnh.
+Sửa tổng quát (CLAUDE.md 7.1 "Trang viết tay", "Công thức"):
+- Màu mực chuẩn chỉ đo trong block chữ; véc-tơ màu chuẩn ≥ 10 → trang viết tay → giữ chữ. 12 trang cũ: màu chuẩn và số
+  block "mực màu" **không đổi** (in ≤ 6.4).
+- Công thức cao (ma trận, phân số): line spacing at-least, gộp hàng, ngoặc co giãn (`mfenced` → `m:d`), độ rộng ma trận
+  hiệu chỉnh bằng Word (Score 3×3: Word 174 pt / ước lượng 176; WQ·WK·WV: 361 / 371).
+- Lỗi có sẵn trong renderer: ô bảng ẩn bắt đầu bằng bảng con → đoạn văn đầu của ô (nằm **trên** bảng con) bị dùng cho
+  đoạn đến sau → dòng "Chia từng phần tử…" nhảy lên đầu trang. Sửa + test.
+- Dòng viết nghiêng bị đo thành nhiều mảnh → cả công thức dồn vào mảnh đầu (cỡ 6 pt) → gộp mảnh nối tiếp.
+
+Kết quả (`convert.py Testcase`, 14 file / 15 trang, `--passes 2`, 188 s): 229 → 1 trang chữ + công thức, lệch dọc 21 pt
+(khối 2 cột đầu trang cao hơn bản gốc, dồn xuống phần dưới); 5acb 1.0 pt; 76ac 3.5 pt nhưng hàng cuối bảng "V - Value"
+tràn sang trang 2. 11 mẫu cũ giữ nguyên (0.0–8.9 pt; images.jpg 5.7 → 6.4 do OCR chạy lại khác chữ).
+Chữ viết tay vẫn OCR sai nhiều (VLM đọc "Vì sao phải scale" → "Vi soo thai scale"): đây là giới hạn OCR, không phải bố cục.
+
 ### Cấu trúc `middle.json` 4.x (đã xác nhận)
 - `pages[].blocks[]`: `type`, `index` (thứ tự đọc), `bbox` **chuẩn hoá 0..1 theo kích thước trang** `[x0, y0, x1, y1]`, `content`.
 - `type` gặp được: `header`, `doc_title` (`level`), `paragraph_title` (`level`), `text`, `list` (`sub_type`, block con),

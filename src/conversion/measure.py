@@ -261,14 +261,37 @@ def hue_offset(rgb: np.ndarray, ref: np.ndarray | None = None) -> np.ndarray:
     return np.linalg.norm(vec, axis=-1)
 
 
-def ink_reference(rgb: np.ndarray, gray: np.ndarray) -> np.ndarray:
-    """The page's typical print colour vector (median over all ink pixels)."""
+def ink_reference(rgb: np.ndarray, gray: np.ndarray,
+                  boxes: list[tuple[int, int, int, int]] | None = None) -> np.ndarray:
+    """The page's typical print colour vector (median over ink pixels).
+
+    `boxes`: the text regions (px). Only their ink counts, so a phone photo's table top or background around
+    the sheet (dark, brown) does not become the "print colour" and turn every letter into "coloured ink"."""
     step = max(1, max(gray.shape) // 1200)
+    if boxes:
+        parts = []
+        for x0, y0, x1, y1 in boxes:
+            g = gray[y0:y1:step, x0:x1:step]
+            if g.size:
+                parts.append(rgb[y0:y1:step, x0:x1:step].astype(np.float32)[ink_mask(g).astype(bool)])
+        pixels = np.concatenate(parts) if parts else np.zeros((0, 3), np.float32)
+        if len(pixels) >= 100:
+            return np.median(pixels - pixels.mean(axis=1, keepdims=True), axis=0)
     small_rgb, small_gray = rgb[::step, ::step].astype(np.float32), gray[::step, ::step]
     pixels = small_rgb[ink_mask(small_gray).astype(bool)]
     if len(pixels) < 100:
         return np.zeros(3, np.float32)
     return np.median(pixels - pixels.mean(axis=1, keepdims=True), axis=0)
+
+
+# |print colour vector| (rgb − grey): print measured ≤ 6.4 on 12 pages (scans, screenshots, photos with a cast);
+# pages written entirely by pen (blue ink) 13.1–14.5
+PEN_PAGE_CHROMA = 10.0
+
+
+def is_pen_page(ink_ref: np.ndarray) -> bool:
+    """The page's own main ink is pen colour: the page is handwritten, colour no longer marks an annotation."""
+    return float(np.linalg.norm(ink_ref)) >= PEN_PAGE_CHROMA
 
 
 def _ink_color(rgb: np.ndarray, mask: np.ndarray, ref: np.ndarray | None = None) -> tuple[str | None, bool]:
@@ -284,9 +307,10 @@ def _ink_color(rgb: np.ndarray, mask: np.ndarray, ref: np.ndarray | None = None)
 
 def measure_block(rgb: np.ndarray, gray: np.ndarray, box_px: tuple[int, int, int, int],
                   ref_height: float | None = None, has_math: bool = False,
-                  ink_ref: np.ndarray | None = None) -> BlockMeasure:
+                  ink_ref: np.ndarray | None = None, pen_page: bool = False) -> BlockMeasure:
     """`ref_height`: typical text line height on the page (px), used to fold stray mark groups.
-    `ink_ref`: the page's print colour (`ink_reference`), so colour is judged relative to the page."""
+    `ink_ref`: the page's print colour (`ink_reference`), so colour is judged relative to the page.
+    `pen_page`: the whole page is handwritten — pen strokes at a line's ends are text, not a scribble."""
     x0, y0, x1, y1 = box_px
     pad = 2
     x0, y0 = max(0, x0 - pad), max(0, y0 - pad)
@@ -295,7 +319,7 @@ def measure_block(rgb: np.ndarray, gray: np.ndarray, box_px: tuple[int, int, int
     mask = ink_mask(crop)
     color, colored = _ink_color(rgb[y0:y1, x0:x1], mask, ink_ref)
     chroma = hue_offset(rgb[y0:y1, x0:x1], ink_ref)              # per-pixel colour distance from print
-    lines = text_lines(mask, x0, y0, ref_height, colored=chroma, has_math=has_math)
+    lines = text_lines(mask, x0, y0, ref_height, colored=None if pen_page else chroma, has_math=has_math)
     for line in lines:
         g = gray[int(line.y0):int(line.y1), int(line.x0):int(line.x1)]
         ink = np.sort(g[_remove_rules(ink_mask(g)).astype(bool)])

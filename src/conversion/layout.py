@@ -48,6 +48,7 @@ class Para:
     line_x: list[tuple[float, float]] | None = None   # per-line printed extent (forced lines are placed
                                                       # individually: real letterheads are not perfectly centred)
     tab_stops: list[float] = field(default_factory=list)   # absolute x (pt) of grid columns ("a) …   b) …")
+    stack: float = 1.0              # tallest formula on the line, in text rows (a 3-row matrix ≈ 3.5)
     ink: tuple[float, float] | None = None   # measured horizontal extent before widening to the typeset text:
                                              # what the XY-cut sees (widened boxes can close a column gap)
 
@@ -306,8 +307,10 @@ def _text_paras(tokens: list[Token], m, box: tuple[float, float], sx: float, sy:
         unit = _unit_width(line_tokens, bold, m.italic)
         typo = Typo(size=width / unit if unit else 12.0, bold=bold, italic=m.italic)
         runs = _runs(line_tokens, typo)
-        para = Para(ln.x0 * sx, ln.x1 * sx, [runs], [centre(ln)], 0.0, outline=outline,
-                    line_x=[(ln.x0 * sx, ln.x1 * sx)])
+        tall = _stack_em(line_tokens)                  # a fraction / matrix needs more than one text row
+        para = Para(ln.x0 * sx, ln.x1 * sx, [runs], [centre(ln)], (ln.y1 - ln.y0) * sy if tall > 1.5 else 0.0,
+                    outline=outline, line_x=[(ln.x0 * sx, ln.x1 * sx)])
+        para.stack = tall
         para.tab_stops = tabs or []
         if tabs:
             para.align = "left"
@@ -362,12 +365,38 @@ def _text_paras(tokens: list[Token], m, box: tuple[float, float], sx: float, sy:
         enough_words = sum(1 for t in forced[i] if t[0] != "tab") >= 4 * len(lns)
         if len(lns) > 1 and not standalone_lines and not centred_short and enough_words:
             paras.append(flowing(forced[i], lns))
+        elif len(lns) > 1 and _stack_em(forced[i]) > 1.5:
+            # one MinerU line holding a matrix / stacked fraction measures as several rows: it is one line
+            paras.append(single(forced[i], _union(lns)))
         else:                                          # independent lines; a line with a wide gap is two
             pieces = [p for ln in lns for p in _pieces(ln, page_w_px)]   # (merged two-column letterhead)
+            words = sum(1 for t in forced[i] if t[0] != "tab")
+            side_by_side = sum(p.x1 - p.x0 for p in pieces) <= 1.1 * (max(p.x1 for p in pieces)
+                                                                     - min(p.x0 for p in pieces))
+            if 1 < len(pieces) and words < len(pieces) and side_by_side:
+                # fewer words than pieces lying one after another: a slanted handwritten line measured in
+                # fragments, not separate lines — keep it whole instead of squeezing it into one fragment
+                paras.append(single(forced[i], _union(lns)))
+                continue
             parts = _split_tokens(forced[i], [(p.x1 - p.x0) * sx for p in pieces])
             for part, piece in zip(parts, pieces):
                 paras.append(single(part, piece))
     return paras
+
+
+def _stack_em(tokens: list[Token]) -> float:
+    """Tallest formula among the tokens, in em (1 = one text row)."""
+    from .math_omml import height_em
+    return max((height_em(t[1]) for t in tokens if t[0] == "math"), default=1.0)
+
+
+def _union(lns: list) -> "Line":
+    """Measured rows that make up one tall line (matrix rows, fraction parts) as one line."""
+    from .measure import Line
+    return Line(y0=min(l.y0 for l in lns), y1=max(l.y1 for l in lns), x0=min(l.x0 for l in lns),
+                x1=max(l.x1 for l in lns), density=float(np.mean([l.density for l in lns])),
+                darkness=float(np.median([l.darkness for l in lns])),
+                letter_h=float(np.median([l.letter_h for l in lns])))
 
 
 def _split_tokens(tokens: list[Token], widths: list[float]) -> list[list[Token]]:
@@ -529,18 +558,26 @@ def build_page(middle_page: dict, image_path: Path, assets: Path,
     def has_math(b) -> bool:
         return any(kind == "math" for kind, _ in _segments(b.get("content"), b["type"]))
 
-    from .measure import ink_reference
-    ink_ref = ink_reference(rgb, gray)                  # the page's own print colour
+    from .measure import ink_reference, is_pen_page
+    text_boxes_px = [px(b["bbox"]) for b in blocks if b["type"] not in ("image", "table") and b.get("bbox")]
+    ink_ref = ink_reference(rgb, gray, text_boxes_px)   # the page's own print colour, from its text only
+    pen_page = is_pen_page(ink_ref)                     # handwritten page: keep every OCR'd line as text
     measured = []
     for b in blocks:
         if b["type"] in ("image", "table") or not b.get("bbox"):
             measured.append(None)
             continue
-        measured.append(measure_block(rgb, gray, px(b["bbox"]), has_math=has_math(b), ink_ref=ink_ref))
+        measured.append(measure_block(rgb, gray, px(b["bbox"]), has_math=has_math(b), ink_ref=ink_ref,
+                                      pen_page=pen_page))
     heights = [ln.y1 - ln.y0 for m in measured if m for ln in m.lines]
     ref_h = float(np.median(heights)) if heights else None
-    measured = [measure_block(rgb, gray, px(b["bbox"]), ref_h, has_math=has_math(b), ink_ref=ink_ref)
+    measured = [measure_block(rgb, gray, px(b["bbox"]), ref_h, has_math=has_math(b), ink_ref=ink_ref,
+                              pen_page=pen_page)
                 if m is not None else None for b, m in zip(blocks, measured)]
+    if pen_page:                                        # a red heading among blue notes is still the text
+        for m in measured:
+            if m is not None:
+                m.colored_ink = False
     dark = [ln.darkness for m in measured if m and not m.colored_ink for ln in m.lines]
     median_dark = float(np.median(dark)) if dark else 128.0
 
@@ -627,7 +664,8 @@ def build_page(middle_page: dict, image_path: Path, assets: Path,
     for item in flow:
         if isinstance(item, Para) and not item.wrap:
             biggest = max(r.typo.size for line in item.lines for r in line)
-            item.line_height = max(item.line_height, biggest * 1.15)
+            # an exact line height clips a formula taller than one row (sizes are final only here)
+            item.line_height = max(item.line_height, biggest * (1.25 * item.stack if item.stack > 1.5 else 1.15))
             if len(item.lines) == 1 and item.line_height == 0.0:
                 item.line_height = biggest * 1.15
             _fit_extent(item)
@@ -646,11 +684,16 @@ def build_page(middle_page: dict, image_path: Path, assets: Path,
     return Page(pw, ph, flow, floats)
 
 
+# Word sets formulas a little wider than the structural estimate (operator spacing, script gaps): room
+# reserved for a standalone line, so its equation is never broken onto a second line
+MATH_ROOM = 1.12
+
+
 def typeset_width(runs: list[Run]) -> float:
     """Width (pt) Word will give one line of runs: Times New Roman text, Cambria Math formulas."""
     from .math_omml import width_em
     from .measure import text_width_pt
-    return sum(width_em(r.latex) * r.typo.size if r.latex
+    return sum(width_em(r.latex) * r.typo.size * MATH_ROOM if r.latex
                else text_width_pt(r.text, r.typo.size, r.typo.font, r.typo.bold, r.typo.italic) for r in runs)
 
 
