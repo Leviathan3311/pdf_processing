@@ -34,6 +34,7 @@ input (image / PDF)
  │                                   scan ──────► render ─┤                                │
  └─ image ───────────────────────────────────────────────┴► flatten · deskew · 3200 px    │
                                                              ► MinerU standard (middle.json)│
+                                                             ► handwriting re-read (VLM)   │
                                                              ► diacritic correction        │
                                                              ► layout measured on image ───┤
                                                                                            ▼
@@ -44,14 +45,18 @@ input (image / PDF)
                                                                                       .docx
 ```
 
-A batch shares every expensive start-up: MinerU loads once for all OCR pages while the spelling model loads in
-parallel; spelling runs in one GPU pass; each closed-loop pass exports all documents with one Word instance.
-A PDF with only text pages starts neither MinerU nor the spelling model.
+A batch shares every expensive start-up: MinerU loads once for all OCR pages while the spelling model and the
+handwriting reader (`llama-server`) load in parallel; the handwritten blocks of every page go through one queue
+(4 parallel requests); spelling runs in one GPU pass; each closed-loop pass exports all documents with one Word
+instance. A PDF with only text pages starts neither MinerU nor the models; a batch without handwriting only pays
+the reader's start-up, which overlaps MinerU.
 
 ## Requirements
 
 - Windows 10/11, Python 3.11
-- NVIDIA GPU recommended (tested: RTX 5070 Ti 16 GB); MinerU uses ONNX DirectML + llama.cpp
+- NVIDIA GPU recommended (tested: RTX 5070 Ti 16 GB); MinerU uses ONNX DirectML + llama.cpp.
+  Peak VRAM with MinerU + corrector + handwriting reader: **14.1 GB**. On a smaller card use `-Quant Q4_K_M`
+  at setup (−1.4 GB) or `--hw-ocr off` (−8.5 GB, handwriting then stays MinerU's text / images)
 - Microsoft Word (for the closed loop; not needed with `--passes 0`). Word also provides `MML2OMML.XSL`,
   used to turn formulas into native equations
 
@@ -121,7 +126,26 @@ original (pt). A `<name>.gt.txt` next to an input adds its character error rate 
 
 ## Results
 
-Batch of 14 files / 17 pages (10 images, 4 scanned PDF pages, 3 digital PDF pages), `--passes 2`:
+**Latest run (2026-11-27, current code)**: `python scripts\convert.py Testcase -o out`, 14 files / 15 pages
+(13 images incl. 3 handwritten notebook pages, 2 scanned PDF pages), `--passes 2`, RTX 5070 Ti:
+**all converted in 137 s, peak VRAM 14.1 GB**, every document on its original page count except one
+(a handwritten table row spills onto a second page).
+
+| Step | Time |
+|---|---|
+| input (classify, flatten, deskew, 3200 px) | 4.2 s |
+| MinerU `standard` on 15 pages (+ corrector and handwriting reader loading in parallel) | 47.1 s |
+| handwriting: 40 blocks to the VLM, 36 accepted, 4 kept as MinerU text / image | 14.0 s |
+| diacritic correction (114 fixes) | 17.6 s |
+| layout (measure + typeset) | 15.8 s |
+| Word closed loop, 2 passes | 30.0 s |
+
+Handwriting only (3 notebook pages, 38 blocks): **57 s for the batch, 10.9 s for the VLM step (≈ 0.29 s/block),
+peak VRAM 12.8 GB**. The VLM reads lines MinerU garbled ("Vì sao phải scale", "Cộng tất cả lại"); printed samples
+are unchanged by this step (red seals and disputed notes stay images). Vertical offset of the printed samples stays
+at 0.0 – 8.9 pt.
+
+Earlier batch of 14 files / 17 pages (10 images, 4 scanned PDF pages, 3 digital PDF pages), `--passes 2`:
 **all converted, 114 s total**, every document on its original page count.
 
 | Input | Mean vertical offset |
