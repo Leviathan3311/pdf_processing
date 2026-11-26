@@ -1,6 +1,6 @@
 # Thiết kế: MinerU + VLM đọc chữ viết tay
 
-Ngày: 2026-11-26 · Áp dụng cho nhánh `minerU` của `pdf_processing` · Số liệu lấy từ [BENCHMARK.md](BENCHMARK.md) trong folder này.
+Ngày: 2026-11-26 (sửa: trạng thái thật của các tín hiệu phát hiện) · Áp dụng cho nhánh `minerU` của `pdf_processing` · Số liệu lấy từ [BENCHMARK.md](BENCHMARK.md) trong folder này.
 
 ## 1. Tóm tắt quyết định
 
@@ -48,17 +48,46 @@ Ngoại lệ là cờ `hw` dùng ở mục 5.4.
 | PDF digital | `page_classifier` (đã có) | PyMuPDF. Không MinerU, không VLM |
 | Scan in máy, không có chữ viết tay | không có vùng nào qua mục 3.2 | **Chỉ MinerU** (+ ProtonX) |
 | Form / văn bản in có điền tay, có chữ ký | có vùng qua mục 3.2 | MinerU + VLM **chỉ ở những vùng đó** |
-| Trang viết tay (vở, ghi chú) | `is_pen_page(ink_ref)` đúng (mực màu chiếm cả trang) | MinerU để lấy bố cục. VLM đọc lại **mọi khối chữ** |
+| Trang viết tay mực màu (vở, ghi chú) | `is_pen_page(ink_ref)` đúng | MinerU để lấy bố cục. VLM đọc lại **mọi khối chữ** |
+| Trang viết tay mực đen | **chưa có cách nhận biết** (T4, mục 3.2) | Tạm thời: như trang in, trừ khi người dùng chạy `--hw-ocr force` |
 
 ### 3.2 Theo vùng: gửi một khối MinerU sang VLM khi có ít nhất một tín hiệu
 
-| # | Tín hiệu | Lấy từ đâu | Ghi chú |
+Trạng thái thực tế trong code (kiểm tra 2026-11-26):
+
+| # | Tín hiệu | Trạng thái | Cách nhận biết |
 |---|---|---|---|
-| T1 | Khối chữ có `colored_ink = True` (mực khác màu chữ in, `hue_offset ≥ 16`) | `measure_block` / `_ink_color` (đã có) | Hiện tại khối này bị cắt thành ảnh. Đây là nơi được lợi nhiều nhất |
-| T2 | Trang là `pen_page` | `is_pen_page` (đã có) | Đọc lại mọi khối `text` / `title` / `list` |
-| T3 | Khối `image` có `sub_type == "text_image"` | MinerU `middle.json` | MinerU thấy chữ trong ảnh nhưng không đọc |
-| T4 | Chữ MinerU trả về trông như rác: tỉ lệ âm tiết không hợp lệ trong tiếng Việt cao, ký tự lạ, lặp | kiểm tra âm tiết + `page_classifier._is_garbled` | Bắt trường hợp viết tay **mực đen**: T1 không bắt được vì mực cùng màu chữ in |
-| T5 | Ô bảng có mực viết tay (T1 hoặc T4 trên vùng của ô) | lưới `_grid_shape` + `hue_offset` theo ô | Chỉ đọc lại **chữ trong ô**. Giữ cấu trúc HTML của MinerU |
+| T1 | Khối chữ mực màu | **Đã có** | `measure_block` gắn `colored_ink = True` khi trung vị `hue_offset(pixel, ink_ref) ≥ 16` (`measure._ink_color`). Số đo: in ≤ 7.4, in dưới con dấu 13.9, bút/dấu 22–59. Hiện tại khối này bị cắt thành ảnh, đây là nơi VLM được lợi nhiều nhất |
+| T2 | Trang viết tay | **Đã có, chỉ cho mực màu** | `ink_reference` = trung vị véc-tơ màu (rgb − xám) của mực **trong các khối chữ MinerU**. `is_pen_page`: `‖ink_ref‖ ≥ 10` (in ≤ 6.4 trên 12 trang, bút xanh 13.1–14.5). Trang vở **mực đen** có `‖ink_ref‖` ≈ chữ in → không bắt được |
+| T3 | MinerU báo ảnh có chữ (`text_image`) | **Chưa kiểm chứng** | Không có code nào trong repo đọc `sub_type`. Mục 13.5 của `CLAUDE.md` liệt kê field `middle.json` mà không có `sub_type`. Việc cần làm: chạy MinerU trên `testcase/` và vài form có chữ ký, grep `sub_type` trong `middle.json`. Không có thì bỏ T3 |
+| T4 | Viết tay mực đen | **Chưa có. Cần đo** | Xem 3.3. Kiểm tra "chữ rác" (`page_classifier._is_garbled`: chỉ `�`, PUA, ký tự điều khiển) **không** dùng được: MinerU đọc sai chữ viết tay ra tiếng Việt trông hợp lý ("Giữ" → "Gửi"), không ra rác |
+| T5 | Ô bảng có chữ viết tay | **Chưa có** | Xem 3.4 |
+
+### 3.3 T4: phát hiện viết tay mực đen (đề xuất, xếp từ rẻ đến tốn)
+
+Không dùng regex hay danh sách âm tiết. `CLAUDE.md` mục 5.5 (1b) và 5.6 đã chốt bỏ cách này.
+
+| Cách | Đo gì | Chi phí | Ghi chú |
+|---|---|---|---|
+| **G. Hình học dòng** | Từ các dòng `measure_block` đã đo: độ lệch chuẩn tương đối của chiều cao dòng, độ dốc / độ cong baseline, độ đều độ đen lõi nét giữa các dòng, góc nghiêng chữ (đã có phép xiên 12° cho chữ nghiêng). Chữ in đều, chữ viết tay dao động | ~0 (số đã đo sẵn) | Ngưỡng phải **tương đối theo trang** (quy tắc chung `CLAUDE.md` 7.1) |
+| **S. Tín hiệu 5.6 có sẵn trong kế hoạch** | S1: surprisal từ LM tiếng Việt. S2: hai lần đọc không khớp | 1 forward pass / trang + đọc lại vùng bị gắn cờ | Không nhận ra viết tay, mà nhận ra **chữ đọc sai**. Vẫn hữu ích: vùng bị S1 + S2 gắn cờ thì gửi VLM |
+| **C. Classifier in / viết tay** | CNN nhỏ (ONNX, vài MB) trên ảnh từng dòng | vài ms / dòng | Cần dữ liệu train: vùng cắt in và viết tay từ `testcase/` + bộ công khai (UIT-HWDB) |
+| **V. Hỏi VLM có/không** | "Vùng này là chữ in hay viết tay?" với `max_tokens 1` | ~0.3–0.5 s / khối | Chỉ dùng cho khối G/C còn phân vân |
+
+Đề xuất: **G trước, V cho khối phân vân**, nếu G không đủ thì mới làm C.
+Tiêu chí nhận: trên các trang in hiện có, gắn nhầm < 2% khối chữ in. Trên trang viết tay mực đen, bắt ≥ 90% khối viết tay.
+Cần có trang vở hoặc form viết bằng bút đen để đo, hiện chưa có.
+
+### 3.4 T5: ô bảng có chữ viết tay (đề xuất)
+
+MinerU chỉ trả HTML của bảng, **không có bbox từng ô**.
+
+1. **Tìm khung ô:**
+   - Bảng có kẻ: `layout._rules(gray, "h"/"v")` đã tìm vị trí đường kẻ. Giao các đường này cho ra lưới ô.
+     Ghép với `_grid_shape(html)` (số hàng/cột, có `rowspan`/`colspan`). Lưới đo được lệch số hàng/cột của HTML thì bỏ qua bảng đó.
+   - Bảng không kẻ: chưa có cách, để nguyên MinerU.
+2. **Kiểm tra từng ô:** mực màu dùng `hue_offset ≥ 16` như T1. Mực đen dùng G/V của 3.3.
+3. **Đọc lại** ô bị gắn cờ bằng VLM, rồi thay chữ vào đúng `<td>` trong HTML. Cấu trúc bảng giữ nguyên.
 
 **Không** gửi sang VLM:
 
@@ -97,8 +126,9 @@ Nếu server không lên trong N giây thì bỏ qua bước 3 và ghi log cản
 1. Không rỗng. Nếu là `<SIGNATURE>` thì giữ ảnh.
 2. Độ dài hợp lý so với vùng: số ký tự / (bề rộng bbox / chiều cao dòng) nằm trong [0.3, 3].
 3. Không lặp: không có n-gram nào (n = 3) lặp quá 3 lần. Không chạm `max_tokens`.
-4. Đúng chữ: ≥ 80% âm tiết là âm tiết tiếng Việt hợp lệ, hoặc là số, ký hiệu toán, từ tiếng Anh.
-   Benchmark bắt được lỗi model trả ký hiệu phiên âm `[mɛ̃] [ɑ̃]`. Mục này loại được lỗi đó.
+4. Đúng hệ chữ: tỉ lệ ký tự thuộc khối Unicode IPA (U+0250–02AF) hoặc ngoài Latin / số / ký hiệu toán phải < 5%.
+   Benchmark gặp lỗi model trả ký hiệu phiên âm `[mɛ̃] [ɑ̃]`, và mục này loại được lỗi đó.
+   Đây là kiểm tra theo khối Unicode, không phải danh sách âm tiết. Kiểm tra nghĩa của chữ để cho S1 (`CLAUDE.md` 5.6).
 5. Không phải lời giải thích: không bắt đầu bằng "Đây là", "Văn bản trong ảnh", "Here is".
 
 ### 5.2 Chọn giữa MinerU và VLM
@@ -107,7 +137,7 @@ Nếu server không lên trong N giây thì bỏ qua bước 3 và ghi log cản
 |---|---|
 | MinerU và VLM gần giống nhau (CER giữa hai bản < 10%) | VLM (thường đúng dấu hơn) |
 | Vùng viết tay (T1/T2/T3/T5), VLM qua kiểm tra | **VLM** |
-| T4 (MinerU ra rác), VLM qua kiểm tra | VLM |
+| T4 (viết tay mực đen, theo 3.3), VLM qua kiểm tra | VLM |
 | VLM trượt kiểm tra | MinerU nếu chữ MinerU hợp lệ, nếu không thì **ảnh cắt** (hành vi hiện tại) |
 | Khác nhau nhiều và cả hai đều hợp lệ | VLM, đánh dấu `needs_review` để báo cáo cuối liệt kê |
 
@@ -130,7 +160,7 @@ Giữ nguyên bbox để layout đo như cũ.
 |---|---|---|
 | Qwen3.5-9B Q6_K + mmproj f16, ctx 4×8192 | 8.8 GiB (đo trên T4) | ctx 4×4096 sẽ thấp hơn |
 | MinerU standard | **chưa đo** | Cần đo trên 5070 Ti |
-| ProtonX | **chưa đo** | |
+| ProtonX (protonx-legal-tc) | ~0.9 GiB | Số đo 2026-11-24 (`CLAUDE.md` 5.5) |
 
 Thời gian thêm vào mỗi trang ≈ số vùng × ~0.55 s (T4, 4 slot). Thời gian thật trên 5070 Ti chưa đo.
 
@@ -181,8 +211,10 @@ Mỗi trang ghi vào báo cáo: số vùng gửi VLM, số vùng được chấp
 2. Bộ đo nhỏ: 1 người viết, 407 từ, chỉ có vở ghi.
    Cần thêm form điền tay, chữ của nhiều người, mực đen (để thử T4), ảnh chụp điện thoại.
 3. Đo tốc độ và VRAM thật trên RTX 5070 Ti / Windows: MinerU, ProtonX và llama-server chạy cùng lúc.
-4. T4 (phát hiện viết tay mực đen) chưa có bộ đo riêng. Cần đo tỉ lệ bắt nhầm chữ in.
+4. T4 (viết tay mực đen) chưa có cách nhận biết và chưa có dữ liệu đo. Tiêu chí nhận ở mục 3.3.
 5. Lỗi chung của mọi model: chữ viết tắt riêng của người viết ("o" có gạch = "không").
    Muốn hết lỗi này cần một bảng viết tắt hoặc fine-tune QLoRA trên chữ của chính người dùng.
 6. Lỗi đọc thành ký hiệu phiên âm `[mɛ̃]` chỉ xuất hiện khi chạy llama.cpp, không có khi chạy transformers.
    Cần kiểm tra cách llama.cpp tiền xử lý ảnh, hoặc nới vùng cắt.
+7. T3 (`text_image`) chưa kiểm chứng là MinerU 4.2.3 có trả hay không (mục 3.2).
+8. T5 cần lưới ô từ đường kẻ. Bảng không kẻ chưa có cách tìm khung ô.
