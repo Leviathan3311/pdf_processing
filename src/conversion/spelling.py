@@ -131,6 +131,8 @@ def _slots(middle: dict) -> list[_Slot]:
         if not isinstance(node, dict):
             return
         kind, content = node.get("type"), node.get("content")
+        if node.get("hw"):                                # handwriting read by the VLM: the legal-text model
+            return                                        # would "fix" the writer's abbreviations (g/trị, k/thức)
         if kind in SKIP_TYPES:                            # images and LaTeX are never touched
             return
         if kind == "table_body" and isinstance(content, str):

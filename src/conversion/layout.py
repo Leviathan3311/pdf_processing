@@ -586,7 +586,8 @@ def build_page(middle_page: dict, image_path: Path, assets: Path,
     for n, (b, m) in enumerate(zip(blocks, measured)):
         box = px(b["bbox"])
         x0, y0, x1, y1 = b["bbox"][0] * pw, b["bbox"][1] * ph, b["bbox"][2] * pw, b["bbox"][3] * ph
-        if b["type"] == "image" or (m is not None and m.colored_ink):
+        # coloured ink stays a picture unless the handwriting reader turned it into text (DESIGN 5.4)
+        if b["type"] == "image" or (m is not None and m.colored_ink and not b.get("hw")):
             floats.append(FloatImage(x0, y0, x1, y1, _crop_png(rgb, box, assets / f"float_{n}.png", ink_ref,
                                                                   line_boxes)))
             continue

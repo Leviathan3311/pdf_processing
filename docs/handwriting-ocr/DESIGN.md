@@ -1,6 +1,6 @@
 # Thiết kế: MinerU + VLM đọc chữ viết tay
 
-Ngày: 2026-11-26 (sửa: trạng thái thật của các tín hiệu phát hiện) · Áp dụng cho nhánh `minerU` của `pdf_processing` · Số liệu lấy từ [BENCHMARK.md](BENCHMARK.md) trong folder này.
+Ngày: 2026-11-26 (sửa: trạng thái thật của các tín hiệu phát hiện; **đã hiện thực 2026-11-27**, chỗ lệch thiết kế ghi ở từng mục) · Áp dụng cho nhánh `minerU` của `pdf_processing` · Số liệu lấy từ [BENCHMARK.md](BENCHMARK.md) trong folder này.
 
 ## 1. Tóm tắt quyết định
 
@@ -58,8 +58,9 @@ Trạng thái thực tế trong code (kiểm tra 2026-11-26):
 | # | Tín hiệu | Trạng thái | Cách nhận biết |
 |---|---|---|---|
 | T1 | Khối chữ mực màu | **Đã có** | `measure_block` gắn `colored_ink = True` khi trung vị `hue_offset(pixel, ink_ref) ≥ 16` (`measure._ink_color`). Số đo: in ≤ 7.4, in dưới con dấu 13.9, bút/dấu 22–59. Hiện tại khối này bị cắt thành ảnh, đây là nơi VLM được lợi nhiều nhất |
+| T1 (bổ sung 2026-11-27) | Trừ mực **đỏ** trên trang in | **Đã có** | Chạy thử: 6/7 khối T1 trên trang in là **chữ trong con dấu đỏ** ("HỎA TỐC", vòng chữ dấu tròn) mà MinerU không đóng khung `seal`. Đỏ (R lớn nhất trong trung vị màu mực) → giữ ảnh như cũ. Bút bi xanh vẫn gửi VLM. Trang vở (T2) không áp dụng: tiêu đề bút đỏ vẫn là chữ |
 | T2 | Trang viết tay | **Đã có, chỉ cho mực màu** | `ink_reference` = trung vị véc-tơ màu (rgb − xám) của mực **trong các khối chữ MinerU**. `is_pen_page`: `‖ink_ref‖ ≥ 10` (in ≤ 6.4 trên 12 trang, bút xanh 13.1–14.5). Trang vở **mực đen** có `‖ink_ref‖` ≈ chữ in → không bắt được |
-| T3 | MinerU báo ảnh có chữ (`text_image`) | **Chưa kiểm chứng** | Không có code nào trong repo đọc `sub_type`. Mục 13.5 của `CLAUDE.md` liệt kê field `middle.json` mà không có `sub_type`. Việc cần làm: chạy MinerU trên `testcase/` và vài form có chữ ký, grep `sub_type` trong `middle.json`. Không có thì bỏ T3 |
+| T3 | MinerU báo ảnh có chữ (`text_image`) | **Bỏ** (2026-11-27) | MinerU 4.2.3 chỉ trả `sub_type: seal` trên cả 14 trang mẫu, không có `text_image` |
 | T4 | Viết tay mực đen | **Chưa có. Cần đo** | Xem 3.3. Kiểm tra "chữ rác" (`page_classifier._is_garbled`: chỉ `�`, PUA, ký tự điều khiển) **không** dùng được: MinerU đọc sai chữ viết tay ra tiếng Việt trông hợp lý ("Giữ" → "Gửi"), không ra rác |
 | T5 | Ô bảng có chữ viết tay | **Chưa có** | Xem 3.4 |
 
@@ -124,7 +125,11 @@ Nếu server không lên trong N giây thì bỏ qua bước 3 và ghi log cản
 ### 5.1 Kiểm tra output VLM (trượt bất kỳ mục nào thì dùng fallback)
 
 1. Không rỗng. Nếu là `<SIGNATURE>` thì giữ ảnh.
-2. Độ dài hợp lý so với vùng: số ký tự / (bề rộng bbox / chiều cao dòng) nằm trong [0.3, 3].
+2. Độ dài hợp lý. **Đã đổi khi hiện thực**: so với số ký tự MinerU đọc ở cùng khối, tỉ lệ trong [0.33, 3]
+   (tương đối theo chính trang). MinerU không có chữ thì so với bề rộng bbox / chiều cao dòng × số dòng, trong [0.33, 6].
+   Ngưỡng [0.3, 3] ban đầu loại nhầm 13/26 bản đọc đúng (chữ viết tay thật nằm ở 3.0–4.4 ký tự / chiều cao dòng).
+   Thêm 2 kiểm tra: không có lệnh LaTeX (`rac`…) ngoài `$`; không viết chữ thường thành biến toán rời (`$s c a l e$`).
+   `X_{proj}` viết thiếu `$` được tự chuyển thành công thức inline.
 3. Không lặp: không có n-gram nào (n = 3) lặp quá 3 lần. Không chạm `max_tokens`.
 4. Đúng hệ chữ: tỉ lệ ký tự thuộc khối Unicode IPA (U+0250–02AF) hoặc ngoài Latin / số / ký hiệu toán phải < 5%.
    Benchmark gặp lỗi model trả ký hiệu phiên âm `[mɛ̃] [ɑ̃]`, và mục này loại được lỗi đó.
@@ -140,11 +145,16 @@ Nếu server không lên trong N giây thì bỏ qua bước 3 và ghi log cản
 | T4 (viết tay mực đen, theo 3.3), VLM qua kiểm tra | VLM |
 | VLM trượt kiểm tra | MinerU nếu chữ MinerU hợp lệ, nếu không thì **ảnh cắt** (hành vi hiện tại) |
 | Khác nhau nhiều và cả hai đều hợp lệ | VLM, đánh dấu `needs_review` để báo cáo cuối liệt kê |
+| Khác nhau nhiều, khối T1 trên trang in (bổ sung 2026-11-27) | **Giữ ảnh**: ghi chú ngắn "Đồng ý" + nét ký, MinerU đọc "Amy", VLM đọc "Đặng", cả hai sai |
 
 ### 5.3 Viết vào `middle.json`
 
 Thay `content` của span bằng chữ VLM và thêm `"hw": true` (cùng `"src": "vlm"`).
 Giữ nguyên bbox để layout đo như cũ.
+
+Khối có công thức cao (phân số, ma trận: `height_em` > 1.5) hoặc chữ thường < 60% ký tự **không** gửi VLM:
+LaTeX của MinerU cho các khối đó tốt hơn (đã thử: VLM viết lại phân số Scale thành chữ). Khối `equation` mà VLM đọc là chữ
+được đổi thành `text`.
 
 ### 5.4 Spelling và layout
 
@@ -158,11 +168,12 @@ Giữ nguyên bbox để layout đo như cũ.
 
 | | VRAM | Ghi chú |
 |---|---|---|
-| Qwen3.5-9B Q6_K + mmproj f16, ctx 4×8192 | 8.8 GiB (đo trên T4) | ctx 4×4096 sẽ thấp hơn |
-| MinerU standard | **chưa đo** | Cần đo trên 5070 Ti |
+| Qwen3.5-9B Q6_K + mmproj f16, ctx 4×4096 | +8.4–8.7 GiB (đo trên 5070 Ti) | server sẵn sàng sau 6–7 s, chạy song song MinerU |
+| MinerU + ProtonX + llama-server cùng lúc | **đỉnh 12.8 GiB** (nền 1.6) | Đo 2026-11-27, 3 trang vở; vừa 16 GB, không cần chạy tuần tự |
 | ProtonX (protonx-legal-tc) | ~0.9 GiB | Số đo 2026-11-24 (`CLAUDE.md` 5.5) |
 
-Thời gian thêm vào mỗi trang ≈ số vùng × ~0.55 s (T4, 4 slot). Thời gian thật trên 5070 Ti chưa đo.
+Thời gian thêm vào mỗi trang ≈ số vùng × ~0.55 s (T4, 4 slot). **Đo trên 5070 Ti (2026-11-27)**: 38 vùng / 3 trang vở
+trong 10.9 s (≈ 0.29 s/vùng, 4 slot), cả lô 57 s gồm Word 2 vòng.
 
 - Trang in: +0 s.
 - Form có khoảng 5 ô điền tay: khoảng +3 s.
@@ -192,7 +203,7 @@ Muốn nhanh hơn nữa:
 
 Mỗi trang ghi vào báo cáo: số vùng gửi VLM, số vùng được chấp nhận, số vùng fallback, số vùng `needs_review`, và thời gian.
 
-## 8. Vị trí trong code (đề xuất)
+## 8. Vị trí trong code (đã làm 2026-11-27; test: `tests/test_handwriting.py`)
 
 | File | Thay đổi |
 |---|---|

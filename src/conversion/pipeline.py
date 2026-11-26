@@ -41,6 +41,19 @@ IMAGE_SUFFIXES = {".jpg", ".jpeg", ".png", ".tif", ".tiff", ".bmp", ".webp"}
 INPUT_SUFFIXES = IMAGE_SUFFIXES | {".pdf"}
 DEFAULT_MODEL = ROOT / "models" / "protonx-legal-tc"
 DEFAULT_MINERU_PYTHON = ROOT / ".venv-mineru" / "Scripts" / "python.exe"
+DEFAULT_HW_SERVER = ROOT / "tools" / "llama.cpp" / "llama-server.exe"
+DEFAULT_HW_MODEL = ROOT / "models" / "qwen3.5-9b" / "Qwen3.5-9B-Q6_K.gguf"
+DEFAULT_HW_MMPROJ = ROOT / "models" / "qwen3.5-9b" / "mmproj-F16.gguf"
+
+
+@dataclass
+class HwOptions:
+    """Handwriting re-read by a local VLM (docs/handwriting-ocr/DESIGN.md section 7)."""
+    mode: str = "auto"                  # auto | off | force
+    server: Path = DEFAULT_HW_SERVER
+    model: Path = DEFAULT_HW_MODEL
+    mmproj: Path = DEFAULT_HW_MMPROJ
+    slots: int = 4
 
 
 @dataclass
@@ -68,6 +81,7 @@ class Job:
     cer_before: float | None = None
     cer_after: float | None = None
     error: str | None = None
+    hw: object | None = None              # handwriting.HwStats
     units: list[Unit] = field(default_factory=list, repr=False)
     _pages: list | None = field(default=None, repr=False)
 
@@ -116,7 +130,8 @@ def _score(job: Job) -> None:
 
 
 def convert(inputs: list[Path], out: Path, passes: int = 2, long_edge: int = 3200, model: Path = DEFAULT_MODEL,
-            mineru_python: Path = DEFAULT_MINERU_PYTHON, work_dir: Path | None = None, log=print) -> list[Job]:
+            mineru_python: Path = DEFAULT_MINERU_PYTHON, work_dir: Path | None = None, log=print,
+            hw: HwOptions | None = None) -> list[Job]:
     jobs = collect_jobs(inputs, Path(out), log)
     if not jobs:
         raise SystemExit("No input images or PDFs")
@@ -124,7 +139,7 @@ def convert(inputs: list[Path], out: Path, passes: int = 2, long_edge: int = 320
     tmp = None if keep else tempfile.TemporaryDirectory(prefix="ocr_docx_")
     work = Path(work_dir) if keep else Path(tmp.name)
     try:
-        return _run(jobs, work, passes, long_edge, model, mineru_python, keep, log)
+        return _run(jobs, work, passes, long_edge, model, mineru_python, keep, log, hw or HwOptions())
     finally:
         if tmp is not None:
             tmp.cleanup()
@@ -164,7 +179,7 @@ def _prepare_inputs(jobs: list[Job], prep: Path, work: Path, long_edge: int) -> 
             job.units = []
 
 
-def _run(jobs, work: Path, passes, long_edge, model, mineru_python, keep, log) -> list[Job]:
+def _run(jobs, work: Path, passes, long_edge, model, mineru_python, keep, log, hw: HwOptions) -> list[Job]:
     prep, ocr, docx_dir = work / "prep", work / "ocr", work / "docx"
     for d in (prep, ocr, docx_dir):
         d.mkdir(parents=True, exist_ok=True)
@@ -175,12 +190,22 @@ def _run(jobs, work: Path, passes, long_edge, model, mineru_python, keep, log) -
     units = [u for j in jobs for u in j.units]
     ocr_units = [u for u in units if u.ocr]
     kinds = Counter(u.kind for u in units)
-    log(f"[1/5] input     {len(jobs)} file(s), {len(units)} page(s): "
+    log(f"[1/6] input     {len(jobs)} file(s), {len(units)} page(s): "
         f"{', '.join(f'{n} {k}' for k, n in kinds.items()) or 'none'}   {time.perf_counter() - t:5.1f} s")
 
-    # MinerU runs in its own process while this one loads the spelling model; skipped when no page needs OCR
+    # MinerU runs in its own process while this one loads the spelling model and llama-server loads the
+    # handwriting reader; all skipped when no page needs OCR
     t = time.perf_counter()
     corrector = None
+    server = None
+    if ocr_units and hw.mode != "off":
+        from .handwriting import VlmServer
+        server = VlmServer(hw.server, hw.model, hw.mmproj, hw.slots, log_path=work / "llama-server.log")
+        if server.available:
+            server.start()
+        else:
+            log(f"      handwriting reader not installed ({hw.server.name} / {hw.model.name}): skipped")
+            server = None
     if ocr_units:
         mineru = subprocess.Popen([str(mineru_python), str(ROOT / "scripts" / "mineru_parse.py"), str(prep),
                                    "-o", str(ocr)], stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True,
@@ -198,20 +223,26 @@ def _run(jobs, work: Path, passes, long_edge, model, mineru_python, keep, log) -
                 elif not job.error:
                     job.error = "OCR failed: " + next((l for l in mineru_log.splitlines() if u.key in l),
                                                       f"{u.key}: no output")
-    log(f"[2/5] ocr       MinerU standard on {len(ocr_units)} page(s) (+ spelling model load)"
+    log(f"[2/6] ocr       MinerU standard on {len(ocr_units)} page(s) (+ spelling model load)"
         f"  {time.perf_counter() - t:5.1f} s")
 
-    t = time.perf_counter()
     read = [u for u in ocr_units if u.raw is not None]
     for u in read:
         u.fixed = copy.deepcopy(u.raw)
+    t = time.perf_counter()
+    if server is not None:
+        _handwriting(jobs, read, prep, server, hw, log, t)
+    else:
+        log(f"[3/6] handwriting off                                   {0.0:5.1f} s")
+
+    t = time.perf_counter()
     if corrector is not None and read:
         from .spelling import correct_many
         changes = {id(u): len(r.changes) for u, r in zip(read, correct_many([u.fixed for u in read], corrector))}
         for job in jobs:
             job.spelling_changes = sum(changes.get(id(u), 0) for u in job.units)
     del corrector
-    log(f"[3/5] spelling  {sum(j.spelling_changes for j in jobs)} diacritic fix(es)                "
+    log(f"[4/6] spelling  {sum(j.spelling_changes for j in jobs)} diacritic fix(es)                "
         f"{time.perf_counter() - t:5.1f} s")
 
     t = time.perf_counter()
@@ -227,7 +258,7 @@ def _run(jobs, work: Path, passes, long_edge, model, mineru_python, keep, log) -
         except Exception as exc:                       # one bad document must not stop the batch
             job.error = f"layout: {type(exc).__name__}: {exc}"
     laid = [j for j in jobs if j._pages]
-    log(f"[4/5] layout    measure + typeset                       {time.perf_counter() - t:5.1f} s")
+    log(f"[5/6] layout    measure + typeset                       {time.perf_counter() - t:5.1f} s")
 
     # closed loop: every pass renders all documents, one Word instance exports all of them,
     # each paragraph moves by its own measured error; keep each document's best pass
@@ -277,7 +308,7 @@ def _run(jobs, work: Path, passes, long_edge, model, mineru_python, keep, log) -
         job.out.parent.mkdir(parents=True, exist_ok=True)
         render_pages(job._pages, job.out)
         _score(job)
-    log(f"[5/5] word      {passes} closed-loop pass(es), 1 Word start each   {time.perf_counter() - t:5.1f} s")
+    log(f"[6/6] word      {passes} closed-loop pass(es), 1 Word start each   {time.perf_counter() - t:5.1f} s")
 
     if keep:                                           # debugging aids only when the work folder is kept
         _debug(jobs, laid, work, prep)
@@ -285,6 +316,40 @@ def _run(jobs, work: Path, passes, long_edge, model, mineru_python, keep, log) -
     log(f"done: {sum(1 for j in jobs if not j.error and j.out.exists())}/{len(jobs)} document(s) "
         f"in {time.perf_counter() - t_all:.1f} s")
     return jobs
+
+
+def _handwriting(jobs, read: list[Unit], prep: Path, server, hw: HwOptions, log, t: float) -> None:
+    """Step 3: the VLM re-reads the handwritten blocks of every page of the batch in one queue (DESIGN 2)."""
+    from .handwriting import apply, find_regions, read_regions, stats_of
+    try:
+        regions = [r for u in read for page in u.fixed.get("pages", [])
+                   for r in find_regions(page, prep / f"{u.key}.jpg", u.key, hw.mode)]
+        if not regions:
+            log(f"[3/6] handwriting no handwritten block                {time.perf_counter() - t:5.1f} s")
+            return
+        t_wait = time.perf_counter()
+        if not server.wait_ready():
+            log("[3/6] handwriting reader did not start (see llama-server.log): MinerU text kept")
+            return
+        waited = time.perf_counter() - t_wait
+        read_regions(regions, server)
+        for r in regions:
+            apply(r)
+        by_unit: dict[str, list] = {}
+        for r in regions:
+            by_unit.setdefault(r.unit, []).append(r)
+        for job in jobs:
+            mine = [r for u in job.units for r in by_unit.get(u.key, [])]
+            if mine:
+                job.hw = stats_of(mine)
+        total = stats_of(regions)
+        log(f"[3/6] handwriting {total.sent} block(s) to the VLM: {total.accepted} accepted, "
+            f"{total.fallback} fallback, {total.review} to review (server wait {waited:.1f} s)"
+            f"  {time.perf_counter() - t:5.1f} s")
+        for note in total.notes:
+            log(f"      {note}")
+    finally:
+        server.stop()
 
 
 def _debug(jobs, laid, work: Path, prep: Path) -> None:
@@ -309,10 +374,11 @@ def _debug(jobs, laid, work: Path, prep: Path) -> None:
 def report(jobs: list[Job]) -> str:
     def pct(v):
         return "—" if v is None else f"{v:.2%}"
-    rows = [f"{'input':<34} {'pages':<26} {'fixes':>5} {'word':>4} {'|Δy| pt':>8} {'CER before→after':>18}"
-            f"  output / error"]
+    rows = [f"{'input':<34} {'pages':<26} {'fixes':>5} {'hw s/a/f/r':>10} {'word':>4} {'|Δy| pt':>8} "
+            f"{'CER before→after':>18}  output / error"]
     for j in jobs:
         dy = "—" if j.layout_dy is None else f"{j.layout_dy:.1f}"
-        rows.append(f"{j.src.name[:34]:<34} {j.kinds[:26]:<26} {j.spelling_changes:>5} {j.word_pages or '—':>4} "
+        rows.append(f"{j.src.name[:34]:<34} {j.kinds[:26]:<26} {j.spelling_changes:>5} {str(j.hw or '—'):>10} "
+                    f"{j.word_pages or '—':>4} "
                     f"{dy:>8} {pct(j.cer_before) + ' → ' + pct(j.cer_after):>18}  {j.error or j.out}")
     return "\n".join(rows)

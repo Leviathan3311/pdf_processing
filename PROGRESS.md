@@ -269,6 +269,25 @@ Kết quả (`convert.py Testcase`, 14 file / 15 trang, `--passes 2`, 188 s): 22
 tràn sang trang 2. 11 mẫu cũ giữ nguyên (0.0–8.9 pt; images.jpg 5.7 → 6.4 do OCR chạy lại khác chữ).
 Chữ viết tay vẫn OCR sai nhiều (VLM đọc "Vì sao phải scale" → "Vi soo thai scale"): đây là giới hạn OCR, không phải bố cục.
 
+### VLM đọc lại chữ viết tay (2026-11-27) — `docs/handwriting-ocr/DESIGN.md`, `src/conversion/handwriting.py`
+Bước mới `[3/6] handwriting`: MinerU giữ bố cục, Qwen3.5-9B Q6_K (`tools/llama.cpp/llama-server.exe`,
+`models/qwen3.5-9b/`, gitignored) đọc lại từng khối viết tay, 4 slot song song. Server khởi động cùng lúc MinerU.
+Cờ `--hw-ocr auto|off|force`; thiếu exe / model → tự bỏ qua (MinerU như cũ). ProtonX bỏ qua span `hw`.
+Đo trên RTX 5070 Ti, `--passes 2`:
+
+| Lô | Vùng gửi / nhận / fallback / review | Bước handwriting | Cả lô | VRAM đỉnh (nền) |
+|---|---|---|---|---|
+| 3 trang vở | 38 / 36 / 2 / 11 | 10.9 s (≈ 0.29 s/vùng) | 57 s | **12.8 GiB** (1.6) |
+| Cả Testcase, 14 file / 15 trang | 40 / 36 / 4 / 11 | 14.0 s | 137 s | **14.1 GiB** (1.6) |
+
+- Chữ vở tốt hơn rõ ("Vì sao phải scale", "Ma trận sau scale", "Cộng tất cả lại", cả trang 5acb). Còn sai: viết tắt
+  riêng, chữ xấu ("Mô hình khố học"), ô bảng viết tay (T5 chưa làm: 76ac "Tôi stag tìm ai").
+- Trang in **không đổi**: lần chạy đầu 6/7 khối T1 là chữ trong **con dấu đỏ** → mực đỏ trên trang in giữ ảnh;
+  ghi chú "Đồng ý" + nét ký (MinerU "Amy", VLM "Đặng") → T1 mà 2 bản đọc lệch nhiều thì giữ ảnh. |Δy| 11 mẫu in 0.0–8.9 pt như trước.
+- Lệch thiết kế: kiểm tra độ dài so với chữ MinerU [0.33, 3] (ngưỡng bbox [0.3, 3] loại nhầm 13/26 bản đúng);
+  thêm "LaTeX ngoài $", "chữ viết thành biến toán"; `X_{proj}` thiếu `$` → công thức; khối công thức cao không gửi VLM; bỏ T3.
+- Test: `tests/test_handwriting.py` (46 test cả bộ qua).
+
 ### Cấu trúc `middle.json` 4.x (đã xác nhận)
 - `pages[].blocks[]`: `type`, `index` (thứ tự đọc), `bbox` **chuẩn hoá 0..1 theo kích thước trang** `[x0, y0, x1, y1]`, `content`.
 - `type` gặp được: `header`, `doc_title` (`level`), `paragraph_title` (`level`), `text`, `list` (`sub_type`, block con),

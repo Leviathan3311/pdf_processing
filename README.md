@@ -19,6 +19,7 @@ One command, batch-capable, writes only the `.docx` files.
 |---|---|
 | **Any input** | `jpg png webp tif bmp` and `pdf`; each PDF page is classified on its own (scan / text / formulas) |
 | **Accurate OCR** | MinerU `standard` (VLM) on images flattened, deskewed and upscaled to 3200 px |
+| **Handwriting** | handwritten blocks (pen-written pages, blue-ink notes on printed pages) are read again by Qwen3.5-9B through `llama-server`; MinerU keeps the layout; a reading that fails the checks keeps MinerU's result |
 | **Vietnamese diacritics** | ProtonX T5 corrector, *constrained*: a change is kept only if the letters stay identical and only the accents differ; codes, numbers and names are locked |
 | **Layout fidelity** | font size, weight, slant and colour measured on the image; a closed loop renders through Microsoft Word and moves every paragraph onto its original position |
 | **Editable output** | text stays in the body flow (no text boxes), real `w:tbl` tables, OMML equations |
@@ -61,28 +62,33 @@ git clone -b minerU https://github.com/Leviathan3311/pdf_processing.git
 cd pdf_processing
 ```
 
-**1. Main environment**
+**One command** (creates both venvs, installs both requirements files, downloads every model, ~10 GB):
+
+```powershell
+powershell -ExecutionPolicy Bypass -File setup.ps1
+```
+
+Options: `-Quant Q4_K_M` (smaller handwriting model), `-LlamaBuild cuda-12.4` (older NVIDIA driver) / `vulkan` / `cpu`.
+Run it again after an interrupted download: finished parts are skipped.
+
+What it does, step by step (to run by hand):
 
 ```powershell
 python -m venv .venv
-.venv\Scripts\pip install -r requirements.txt
-```
-
-**2. MinerU** (separate venv, so its dependency pins never clash with the main environment)
-
-```powershell
+.venv\Scripts\pip install -r requirements.txt                    # main environment
 python -m venv .venv-mineru
-.venv-mineru\Scripts\pip install -r requirements-mineru.txt
-.venv-mineru\Scripts\mineru-models-download
+.venv-mineru\Scripts\pip install -r requirements-mineru.txt      # MinerU, separate so its pins never clash
+.venv-mineru\Scripts\mineru-models-download                      # MinerU models
+.venv\Scripts\python scripts\download_models.py                  # the models below + llama.cpp
 ```
 
-**3. Spelling model** (`protonx-models/protonx-legal-tc`, ~0.9 GB)
+| Downloaded by `download_models.py` | Source | Folder | Size |
+|---|---|---|---|
+| Diacritic corrector | `protonx-models/protonx-legal-tc` | `models/protonx-legal-tc` | ~0.9 GB |
+| Handwriting reader (VLM) | `unsloth/Qwen3.5-9B-GGUF`: `Qwen3.5-9B-Q6_K.gguf` + `mmproj-F16.gguf` | `models/qwen3.5-9b` | ~7.9 GB |
+| `llama-server` | llama.cpp release `b12777`, CUDA 13.5 build | `tools/llama.cpp` | ~0.8 GB |
 
-```powershell
-huggingface-cli download protonx-models/protonx-legal-tc --local-dir models/protonx-legal-tc
-```
-
-Model weights are not stored in git (`models/` is ignored).
+Model weights and binaries are not stored in git (`models/`, `tools/` are ignored): GitHub refuses files over 100 MB.
 
 ## Usage
 
@@ -107,6 +113,8 @@ python scripts\convert.py cong_van.pdf -o D:\ket_qua\cong_van.docx
 | `--long-edge` | `3200` | OCR image size (px); 3200 measured best |
 | `--model` | `models/protonx-legal-tc` | spelling model folder |
 | `--mineru-python` | `.venv-mineru\Scripts\python.exe` | interpreter of the MinerU venv |
+| `--hw-ocr` | `auto` | handwriting re-read: `auto` handwritten blocks only, `off` MinerU only, `force` every prose block |
+| `--hw-model`, `--hw-mmproj`, `--hw-server`, `--hw-slots` | `models/qwen3.5-9b/…`, `tools/llama.cpp/llama-server.exe`, `4` | handwriting reader files and parallel requests |
 
 The run ends with a report per file: page kinds, diacritic fixes, Word page count, mean vertical offset from the
 original (pt). A `<name>.gt.txt` next to an input adds its character error rate (CER) before / after correction.
@@ -130,7 +138,8 @@ Diacritic correction on a scanned official letter: word errors 18 → 8. Full me
 
 ```
 src/conversion/
-  pipeline.py           batch orchestration (input → OCR → spelling → layout → closed loop)
+  pipeline.py           batch orchestration (input → OCR → handwriting → spelling → layout → closed loop)
+  handwriting.py        pick handwritten blocks, read them with the VLM, check and write back
   page_classifier.py    per-page PDF kind: scan / text_complex / text_simple
   pymupdf_extractor.py  digital PDF pages → layout, straight from the text layer
   preprocess.py         background flattening, deskew, upscale; PDF page rendering
@@ -143,6 +152,7 @@ src/conversion/
   word_export.py        DOCX → PDF through Word (one instance per batch)
 scripts/
   convert.py            command-line entry point
+  download_models.py    download the models and llama.cpp (used by setup.ps1)
   mineru_parse.py       MinerU runner (runs in .venv-mineru)
   render_layout.py      re-run only the layout step on a kept work folder
   eval_ocr.py           character error rate against hand-typed ground truth
@@ -169,7 +179,9 @@ Sample documents contain real personal data: keep them in `Testcase/` (git-ignor
 ## Limitations
 
 - Bold / italic is measured per line, not per word: an italic phrase inside a paragraph is not reproduced.
-- Handwriting is kept as an image; handwritten digits inside a printed line can enlarge that line.
+- Handwriting: pen-written pages and blue-ink notes become text; red seals, signatures and notes the two readers
+  disagree on stay images. Handwritten table cells and black-ink handwriting are not detected yet.
+  Peak VRAM with MinerU + corrector + VLM: 14.1 GB on a 16 GB card (`--hw-ocr off` frees ~8.5 GB).
 - Digital PDFs: vector graphics other than thin rules (charts, diagrams) and rotated text are not yet carried over.
 - PDF pages with formulas go through OCR (MinerU `flash` on the text layer is not wired yet).
 - Windows only for now (Word COM for the closed loop, DirectML for MinerU).
@@ -177,5 +189,5 @@ Sample documents contain real personal data: keep them in `Testcase/` (git-ignor
 ## License
 
 Code: [Apache 2.0](LICENSE). Third-party models keep their own licenses: MinerU — *MinerU Open Source License*;
-`protonx-models/protonx-legal-tc` — **non-commercial** (for commercial use, swap in an Apache-2.0 corrector such as
+Qwen3.5-9B — see its model card; `protonx-models/protonx-legal-tc` — **non-commercial** (for commercial use, swap in an Apache-2.0 corrector such as
 `nrl-ai/vn-spell-correction-base` via `--model`).

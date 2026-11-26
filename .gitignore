@@ -70,3 +70,6 @@ temp/
 chroma_db/
 uploads/
 outputs/
+
+# Local tools (llama.cpp binaries)
+tools/
