@@ -280,10 +280,12 @@ def _pieces(ln, page_w_px: float | None = None) -> list:
 
 def _text_paras(tokens: list[Token], m, box: tuple[float, float], sx: float, sy: float, median_dark: float,
                 title: bool, outline, standalone_lines: bool = False,
-                page_w_px: float | None = None) -> list["Para"]:
+                page_w_px: float | None = None, read_lines: bool = False) -> list["Para"]:
     """Paragraphs for one text block: measured lines, sizes, weights, and how MinerU's lines sit on them.
 
     `standalone_lines`: the block is a heading / letterhead / footer — its lines never flow as one paragraph.
+    `read_lines`: handwriting (read by the VLM, or any block of a pen page without a matrix): the reader's line
+    breaks are the written lines, more reliable than matching uneven handwriting by width.
     Otherwise a MinerU text line spanning several scan lines flows (wraps) unless the lines are short and
     centred (a signature block): MinerU's block type is a sturdier signal than line widths, which bend on
     curled or photographed pages."""
@@ -331,6 +333,42 @@ def _text_paras(tokens: list[Token], m, box: tuple[float, float], sx: float, sy:
                     centres, pitch or size * 1.2, wrap=True, justify=min(body) > 0.93 * block_w,
                     first_indent=first_indent if abs(first_indent) > 0.3 * size else 0.0,
                     align="left", outline=outline)
+
+    if read_lines and len(forced) > 1:
+        # the handwriting reader's line breaks are the written lines. Matching them onto the measured lines
+        # by width fails on handwriting (uneven letters, lines that touch, drift or curl) and sets stray words
+        # huge, so: one size for the block that fits the longest line and the line pitch, left-aligned; each
+        # line on its measured line when the counts agree, else the block's ink height shared evenly
+        top, bottom = min(ln.y0 for ln in lines) * sy, max(ln.y1 for ln in lines) * sy
+        left, right = min(ln.x0 for ln in lines) * sx, max(ln.x1 for ln in lines) * sx
+        bold = sum(bold_of(ln) for ln in lines) > len(lines) / 2
+        # size from all the ink against all the text, not from the longest line: the reader sometimes joins two
+        # written lines into one; such a line is split again at the block width
+        units = [_unit_width(f, bold, m.italic) for f in forced]
+        ink_width = sum((ln.x1 - ln.x0) * sx for ln in lines)
+        size = ink_width / sum(units) if sum(units) > 0 else 12.0
+        size = min(size, (bottom - top) / max(len(lines), len(forced)) / 1.15)
+        split: list[list[Token]] = []
+        for f, u in zip(forced, units):
+            k = int(np.ceil(u * size / (1.05 * (right - left)))) if u > 0 else 1
+            split += _split_tokens(f, [right - left] * k) if k > 1 else [f]
+        forced = [f for f in split if f]
+        units = [_unit_width(f, bold, m.italic) for f in forced]
+        pitch = (bottom - top) / len(forced)
+        same = len(forced) == len(lines)
+        centres = ([centre(ln) for ln in lines] if same
+                   else [top + pitch * (k + 0.5) for k in range(len(forced))])
+        starts = [ln.x0 * sx for ln in lines] if same else [left] * len(forced)
+        fits = min((right - s) / u for s, u in zip(starts, units) if u > 0) if max(units) > 0 else size
+        size = min(size, fits, pitch / 1.15)
+        typo = Typo(size=size, bold=bold, italic=m.italic)      # shared: the block's size is set once
+        paras = []
+        for f, c, s, u in zip(forced, centres, starts, units):   # a line each, so only a fraction's line
+            para = Para(s, s + u * size, [_runs(f, typo)], [c], pitch, align="left", outline=outline,
+                        line_x=[(s, s + u * size)])              # grows taller
+            para.stack = _stack_em(f)
+            paras.append(para)
+        return paras
 
     widths = [(ln.x1 - ln.x0) * sx for ln in lines]
     gaps = [sum(e - s for s, e in ln.gaps) * sx for ln in lines]
@@ -555,8 +593,15 @@ def build_page(middle_page: dict, image_path: Path, assets: Path,
     blocks = sorted(_flatten(middle_page.get("blocks", [])), key=lambda b: b.get("index", 0))
 
     # pass 1: measure every text block (typical line height first, to fold stray accent groups)
+    from .math_omml import height_em
+
     def has_math(b) -> bool:
-        return any(kind == "math" for kind, _ in _segments(b.get("content"), b["type"]))
+        # a formula taller than the text (scripts 1.3 em, fractions, matrices) splits its line into stacked
+        # groups; a symbol on the line (→, k, softmax) does not, and must not switch off the text rules
+        return math_em(b) > 1.0
+
+    def math_em(b) -> float:
+        return max((height_em(v) for k, v in _segments(b.get("content"), b["type"]) if k == "math"), default=0.0)
 
     from .measure import ink_reference, is_pen_page
     text_boxes_px = [px(b["bbox"]) for b in blocks if b["type"] not in ("image", "table") and b.get("bbox")]
@@ -568,11 +613,11 @@ def build_page(middle_page: dict, image_path: Path, assets: Path,
             measured.append(None)
             continue
         measured.append(measure_block(rgb, gray, px(b["bbox"]), has_math=has_math(b), ink_ref=ink_ref,
-                                      pen_page=pen_page))
+                                      pen_page=pen_page, tall_math=math_em(b) > 2.0))
     heights = [ln.y1 - ln.y0 for m in measured if m for ln in m.lines]
     ref_h = float(np.median(heights)) if heights else None
     measured = [measure_block(rgb, gray, px(b["bbox"]), ref_h, has_math=has_math(b), ink_ref=ink_ref,
-                              pen_page=pen_page)
+                              pen_page=pen_page, tall_math=math_em(b) > 2.0)
                 if m is not None else None for b, m in zip(blocks, measured)]
     if pen_page:                                        # a red heading among blue notes is still the text
         for m in measured:
@@ -583,6 +628,7 @@ def build_page(middle_page: dict, image_path: Path, assets: Path,
 
     line_boxes = [(ln.x0, ln.y0, ln.x1, ln.y1) for m in measured if m and not m.colored_ink for ln in m.lines]
     flow, floats, size_slots = [], [], []      # size_slots: (Typo) objects to cluster afterwards
+    read_typos: list[Typo] = []                # one per multi-line block set from its read lines
     for n, (b, m) in enumerate(zip(blocks, measured)):
         box = px(b["bbox"])
         x0, y0, x1, y1 = b["bbox"][0] * pw, b["bbox"][1] * ph, b["bbox"][2] * pw, b["bbox"][3] * ph
@@ -619,10 +665,22 @@ def build_page(middle_page: dict, image_path: Path, assets: Path,
         title = b["type"] in ("doc_title", "paragraph_title", "title")
         outline = b.get("level") if title else None
         standalone = title or b["type"] in ("header", "footer", "page_number", "page_footnote")
-        for para in _text_paras(tokens, m, (x0, x1), sx, sy, median_dark, title, outline, standalone, img_w):
+        read = bool(b.get("hw")) or (pen_page and math_em(b) <= 2.0)
+        for para in _text_paras(tokens, m, (x0, x1), sx, sy, median_dark, title, outline, standalone, img_w,
+                                read_lines=read):
             for line in para.lines:
                 size_slots += [r.typo for r in line]
             flow.append(para)
+            typo = para.lines[0][0].typo
+            if read and len(_token_lines(tokens)) > 1 and all(typo is not t for t in read_typos):
+                read_typos.append(typo)
+
+    # one hand writes at one size: a block whose ink is wider than its text (crossed-out words, a drawn
+    # bracket) must not come out far larger than the rest of the page (measured: 2.6 vs 1.3–2.0 elsewhere)
+    if len(read_typos) >= 3:
+        usual = float(np.median([t.size for t in read_typos]))
+        for t in read_typos:
+            t.size = min(max(t.size, 0.85 * usual), 1.1 * usual)
 
     # a "word" of one or two characters set far larger than the page's text is a pen mark ("/", a tick)
     # that OCR read as text: keep it as the picture it is
@@ -891,10 +949,26 @@ def xy_cut(items: list, x0: float, x1: float):
             children += node.children if isinstance(node, VStack) else [node]
         return VStack(children, x0, x1)
     cols = _groups(items, axis=0, min_gap=4.0)
+    if len(cols) == 1:
+        # side-by-side handwritten columns touch their dividing line, so their ink overlaps a little; blocks
+        # sharing a band cannot be stacked, so a small overlap (≤ 5 % of the narrower block) is still a column
+        narrow = min(_bounds(it)[2] - _bounds(it)[0] for it in items)
+        cols = _groups(items, axis=0, min_gap=-0.05 * narrow)
     if len(cols) > 1:
         edges = [x0] + [(max(_bounds(i)[2] for i in a) + min(_bounds(i)[0] for i in b)) / 2
                         for a, b in zip(cols, cols[1:])] + [x1]
         return HSplit([xy_cut(c, edges[k], edges[k + 1]) for k, c in enumerate(cols)], x0, x1)
+    # a tall formula's line height (1.25 × its rows) reaches into the row below: a row of side-by-side
+    # matrices then joins the formula's band and, with no column gap past the wide formula, gets stacked.
+    # Bands overlapping by ≤ 30 % of the shorter item are still separate rows
+    short = min(_bounds(it)[3] - _bounds(it)[1] for it in items)
+    rows = _groups(items, axis=1, min_gap=-0.3 * short)
+    if len(rows) > 1:
+        children = []
+        for row in rows:
+            node = xy_cut(row, x0, x1)
+            children += node.children if isinstance(node, VStack) else [node]
+        return VStack(children, x0, x1)
     return VStack(sorted(items, key=lambda it: _bounds(it)[1]), x0, x1)
 
 

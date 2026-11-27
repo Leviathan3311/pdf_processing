@@ -56,6 +56,19 @@ def test_spans_turn_bare_subscripts_into_math_but_not_snake_case():
         ("text", "Output = "), ("equation_inline", "X_{proj}"), ("text", " + Z, file_name")]
 
 
+def test_spans_unwrap_prose_lines_set_as_one_environment():
+    text = (r"lớp đáy $$\begin{gathered} \text{melanocyte} \rightarrow \text{chu trình sắc tố} \\ "
+            r"\text{keratinocyte} \rightarrow \text{chu trình sừng} \end{gathered}$$")
+    spans = _spans(text)
+    joined = "".join(s["content"] if s["type"] == "text" else f"[{s['content']}]" for s in spans)
+    assert joined == "lớp đáy melanocyte [\\rightarrow] chu trình sắc tố\nkeratinocyte [\\rightarrow] chu trình sừng"
+
+
+def test_spans_keep_a_real_matrix_environment():
+    spans = _spans(r"$\begin{array}{cc} 1 & 2 \\ 3 & 4 \end{array}$")
+    assert [s["type"] for s in spans] == ["equation_inline"]
+
+
 def test_prose_block_skips_tall_math_and_pictures():
     assert _prose_block({"type": "text", "bbox": [0, 0, 1, 1], "content": "Mô hình học máy"})
     assert not _prose_block({"type": "image", "bbox": [0, 0, 1, 1], "content": "x"})

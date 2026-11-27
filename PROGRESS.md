@@ -288,6 +288,32 @@ Cờ `--hw-ocr auto|off|force`; thiếu exe / model → tự bỏ qua (MinerU nh
   thêm "LaTeX ngoài $", "chữ viết thành biến toán"; `X_{proj}` thiếu `$` → công thức; khối công thức cao không gửi VLM; bỏ T3.
 - Test: `tests/test_handwriting.py` (46 test cả bộ qua).
 
+### Ảnh chụp vở dưới đèn màu (2026-11-27) — `test_case_2/` (2 ảnh: giấy tím / xanh, thảm hoạt hình quanh tờ)
+Trước: không dùng được — cột 25 dòng thành 1 dòng cỡ ~3 pt, 21 / 41 mảnh ảnh rác từ tấm thảm, VLM chạm max_tokens.
+Nguyên nhân và sửa (tổng quát, CLAUDE.md 5.5.3 + 7.1 "Trang viết tay"):
+- Chưa cắt tờ giấy → `preprocess.find_paper` (màu giấy quanh tâm, cắt khi ≤ 85 % khung) + nắn phối cảnh + viền 3 %.
+- Đường chia cột / ngoặc vẽ tay (cao 7.6–26 × chiều cao chữ) chồng mọi dòng → gộp thành 1 → bỏ nét > 4 × chữ (trang viết tay).
+- Dòng viết nghiêng / giấy cong → bù nghiêng từng khối (trang viết tay).
+- Mũi tên `→` (công thức inline cao 1 em) bật chế độ công thức → tắt luật trên → chỉ công thức > 1 em mới tính.
+- VLM gói nhiều dòng chữ vào `egin{gathered}…` → tách lại từng dòng (`handwriting._unwrap_rows`); chạm max_tokens → đọc lại ×2.
+- Ghép dòng VLM ↔ dòng đo theo bề rộng sai trên chữ viết tay → dòng `
+` đọc được là chuẩn, 1 cỡ / khối, kẹp quanh trung vị trang.
+- 2 cột chữ chạm đường chia cột (chồng 8 pt) → XY-cut cho chồng ≤ 5 %; hàng ma trận WQ/WK/WV bị công thức cao phía trên
+  lấn → tách hàng khi chồng ≤ 30 % (lỗi có sẵn, lộ ra sau khi 76ac được cắt giấy).
+
+Kết quả (`--passes 2`, RTX 5070 Ti):
+
+| Lô | VLM gửi / nhận / fallback / review | Cả lô | VRAM đỉnh (nền) | Trang Word, lệch dọc |
+|---|---|---|---|---|
+| test_case_2 (2 ảnh) | 12 / 12 / 0 / 8 | 53 s | 13.5 GiB (2.1) | 1 + 1 trang, 9.6 / 11.7 pt |
+| Testcase (14 file / 15 trang) | 41 / 36 / 5 / 12 | 137 s | 14.7 GiB (2.1) | 11 mẫu in **không đổi** (0.0–8.9 pt) |
+
+Trang vở cũ: 229 21.6 → 27.9 pt (nhìn tương đương), 5acb 0.1 → 4.0 pt (nhìn tốt hơn: dòng tách đúng), 76ac được cắt giấy,
+ma trận WQ/WK/WV lại nằm cạnh nhau, 3.0 pt, hàng cuối bảng vẫn tràn trang 2 (lỗi cũ).
+Còn sót: 229 "• Dạng 2: …" bị tách đôi (VLM viết cả vế thành công thức, độ rộng ước lượng > khung → tách lại);
+0b37 dòng "lớp đáy 2 theo gốc" lặp (MinerU tách tiêu đề thành khối chồng lên khối sau); VLM đọc "60 tuổi" → "60 giờ".
+Test: 53 (thêm `tests/test_preprocess.py`, dòng nghiêng, đường chia cột, XY-cut ma trận, tách `gathered`).
+
 ### Cấu trúc `middle.json` 4.x (đã xác nhận)
 - `pages[].blocks[]`: `type`, `index` (thứ tự đọc), `bbox` **chuẩn hoá 0..1 theo kích thước trang** `[x0, y0, x1, y1]`, `content`.
 - `type` gặp được: `header`, `doc_title` (`level`), `paragraph_title` (`level`), `text`, `list` (`sub_type`, block con),

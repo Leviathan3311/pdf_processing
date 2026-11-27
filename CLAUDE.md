@@ -33,7 +33,7 @@ File (PDF / jpg / png)
   │
   ├─[1] PageClassifier (PyMuPDF, ~ms/trang)   → nhãn cho TỪNG trang (mục 4)
   │
-  ├─[1b] Tiền xử lý ảnh (chỉ SCAN/ảnh, `preprocess.py`): làm phẳng nền + deskew ±5° (đã làm); tìm khung giấy + nắn phối cảnh (chưa),
+  ├─[1b] Tiền xử lý ảnh (chỉ SCAN/ảnh, `preprocess.py`): tìm khung giấy + nắn phối cảnh + viền 3% (đã làm 2026-11-27), làm phẳng nền + deskew ±5° (đã làm),
   │      **phóng to cạnh dài 3200 px** (bắt buộc — sửa chính tả hiệu quả nhất, mục 5.5)
   │
   ├─[2] Extract theo nhãn (song song CPU ‖ GPU)
@@ -249,7 +249,9 @@ mẫu công văn còn 16 chỗ/322 từ: **12 chỉ sai dấu** (tội, để, �
 - Mọi thay đổi → Track Changes trong DOCX. Đo CER trước/sau **và** số chữ đúng bị sửa sai (≈ 0).
 - Đo bằng `scripts/bench_llm.py --model models/<tên> --middle <middle.json> --gt <gt.txt>`.
 
-**3. Ảnh chụp điện thoại:** tìm khung giấy + nắn phối cảnh + cắt nền trước khi phóng to.
+**3. Ảnh chụp điện thoại:** tìm khung giấy + nắn phối cảnh + cắt nền trước khi phóng to (**đã làm** 2026-11-27, `preprocess.find_paper`:
+vùng liền khối quanh tâm ảnh có màu giấy — đo sau khi đóng nét chữ — nên đèn màu / giấy màu vẫn là "giấy"; chỉ cắt khi tờ giấy
+≤ 85 % khung hình và lấp ≥ 90 % tứ giác của nó. Đo: ảnh có bàn / vải quanh tờ 0.62–0.82, scan / screenshot / ảnh đầy khung giữ nguyên).
 **Chữ viết tay** (MinerU trả `text_image`, hoặc block vẫn sai sau bước 2) → **giữ dạng ảnh crop** trong DOCX,
 không chèn chữ sai. **Ngoại lệ (2026-11-24): trang viết tay toàn bộ** (vở ghi, bài giải) → giữ **chữ + công thức** như
 trang in (mục 7.1, "Trang viết tay"); người dùng cần nội dung sửa được, không cần 40 ảnh cắt.
@@ -330,7 +332,8 @@ MinerU không cho font / cỡ / đậm / màu → **mọi thứ đo trên ảnh*
 | Font | **Times New Roman** (thể thức văn bản hành chính). Phân biệt Arial bằng độ rộng **không tin được** ở độ phân giải scan → bỏ |
 | Đậm | **Độ đen lõi nét** (trung bình 1/3 điểm ảnh tối nhất) < 0.83 × trung vị trang. Đo: đậm 18–45, thường ≥ 47. Độ dày nét / tỉ lệ phủ mực **không phân biệt được** (đã thử) |
 | Nghiêng | Tỉ lệ cột trống sau khi xiên 12° > 1.1 (nghiêng 1.21–1.31, đứng ≤ 0.95) — mức block |
-| Trang viết tay | Màu mực chuẩn (`ink_reference`) chỉ lấy mực **trong các block chữ** MinerU (mặt bàn / nền quanh tờ giấy trong ảnh chụp không bị tính là "màu in"). Véc-tơ màu mực chuẩn ‖rgb − xám‖ ≥ 10 (in ≤ 6.4 trên 12 trang; bút bi xanh 13.1–14.5) → **trang viết tay**: mọi block chữ giữ là chữ (tiêu đề bút đỏ cũng vậy), không cắt nét màu ở đầu dòng; chỉ `image` của MinerU là ảnh. Dòng viết nghiêng đo thành nhiều mảnh nằm nối tiếp mà ít từ hơn số mảnh → gộp lại 1 dòng |
+| Trang viết tay | Màu mực chuẩn (`ink_reference`) chỉ lấy mực **trong các block chữ** MinerU (mặt bàn / nền quanh tờ giấy trong ảnh chụp không bị tính là "màu in"). Véc-tơ màu mực chuẩn ‖rgb − xám‖ ≥ 10 (in ≤ 6.4 trên 12 trang; bút bi xanh 13.1–14.5) → **trang viết tay**: mọi block chữ giữ là chữ (tiêu đề bút đỏ cũng vậy), không cắt nét màu ở đầu dòng; chỉ `image` của MinerU là ảnh. Dòng viết nghiêng đo thành nhiều mảnh nằm nối tiếp mà ít từ hơn số mảnh → gộp lại 1 dòng. **Bổ sung 2026-11-27** (ảnh vở dưới đèn màu): nét cao > 4 × chiều cao chữ (đường chia cột vẽ tay, ngoặc "[" nhiều dòng) không tạo dòng (trừ khối có ma trận > 2 em); khối viết nghiêng / giấy cong được **bù nghiêng riêng** (góc làm tâm nét chữ tách hàng rõ nhất, chỉ khi ≥ 1° và tách tốt hơn ≥ 15 %); ngưỡng gộp dòng chặt của khối công thức chỉ cho ma trận (nét chữ viết tay chồng 0.37 dòng); ký hiệu cao 1 dòng (→) không tính là công thức. Khối do VLM đọc và mọi khối chữ trang viết tay không có ma trận: **dòng `
+` đọc được là chuẩn**, không ghép theo bề rộng — số dòng khớp thì đặt đúng dòng đo, lệch thì chia đều khung mực; một cỡ cho khối = tổng bề rộng mực / tổng chiều dài chữ, kẹp −15 %/+10 % quanh trung vị trang; dòng VLM dài hơn khung tách lại. XY-cut: 2 khối cùng băng ngang chồng nhau ≤ 5 % bề rộng vẫn là 2 cột (chữ chạm đường chia cột); băng không tách được cột thì thử tách hàng với chồng ≤ 30 % chiều cao (khoảng dòng 1.25× của công thức cao lấn xuống hàng ma trận WQ/WK/WV). Bỏ nét cao + bù nghiêng **chỉ trên trang viết tay** (trên ảnh chụp chữ in, bỏ nét cao làm lệch 1.1 → 15 pt, bù nghiêng → 39 pt) |
 | Màu / chữ viết tay | **Lệch màu tương đối** với màu mực của chính trang (`ink_reference`, bền với ảnh ám màu): trung vị ≥ 16 (in ≤ 7.4, in dưới con dấu 13.9, bút/dấu 22–59). Nét bút ≤ 2 ký tự cỡ > 1.8× cỡ thường cũng là ảnh. Crop ảnh nổi: mực in trong vùng dấu được làm trong suốt → **ảnh nổi** PNG nền trong suốt đúng vị trí (chữ ký, "Đồng ý", nét ký). MinerU `image` (con dấu…) cũng vậy |
 | Khối song song | **Recursive XY-cut** (băng ngang → cột) → bảng ẩn không viền, độ rộng cột theo x. Nhóm hàng theo Y kiểu code cũ đã thử và **sai**. Một dòng ảnh chứa 2 cột (quốc hiệu ‖ cơ quan) → tách tại khe **rộng nhất ở vùng giữa trang** (30–70%), ≥ 3× khe trung vị và ≥ 1 chiều cao chữ không dấu, 2 mảnh ở 2 nửa trang |
 | Dòng MinerU ↔ dòng ảnh | Quy hoạch động (`_match_lines`): 1 dòng `\n` trải k dòng ảnh (đoạn chảy) **hoặc** nhiều dòng `\n` trên 1 dòng ảnh (lưới bài tập "a) … b) …": **tab stop đúng khe trắng đo được**; không có khe → nối bằng dấu cách) |
@@ -350,7 +353,7 @@ hoạch động giữ cỡ suy ra đồng đều; crop con dấu chỉ xoá nét
 **Quy tắc chung (2026-11-24):** mọi ngưỡng bố cục phải **tương đối theo chính trang** (khe trung vị, màu mực trang, chiều cao chữ không dấu, loại block MinerU), không theo số tuyệt đối của 1 mẫu; sửa xong chạy lại **cả** `Testcase`.
 
 Chưa làm: kiểu chữ **trong** đoạn (cụm nghiêng "(có danh sách kèm theo)", số "1." đậm); ngắt dòng từng chữ trong đoạn
-có thể lệch 1 từ so với bản gốc; ảnh chụp điện thoại (cần bước 1b tìm khung giấy + nắn phối cảnh trước).
+có thể lệch 1 từ so với bản gốc.
 
 ## 8. Hiệu năng
 

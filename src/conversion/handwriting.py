@@ -251,8 +251,11 @@ def read_regions(regions: list[Region], server: VlmServer) -> None:
     """All regions of the batch through one queue, `slots` requests at a time (DESIGN 6)."""
     def one(r: Region) -> None:
         t = time.perf_counter()
+        limit = max(64, int(1.5 * r.expected_chars))
         try:
-            r.text, r.finish = server.read(r.image, max(64, int(1.5 * r.expected_chars)))
+            r.text, r.finish = server.read(r.image, limit)
+            if r.finish == "length":                      # the estimate from the measured lines was short:
+                r.text, r.finish = server.read(r.image, 2 * limit)   # one more try, still bounded (repeats)
         except Exception as exc:                          # a failed request falls back like a failed check
             r.text, r.finish = None, f"error: {type(exc).__name__}"
         r.seconds = time.perf_counter() - t
@@ -335,6 +338,38 @@ def _distance(a: str, b: str) -> float:
 
 
 _BARE_SCRIPT = re.compile(r"\b[A-Za-z0-9]+(?:[_^]\{[^{}$]*\})+")   # "X_{proj}" written without $
+_ROWS_ENV = re.compile(r"\\begin\{(gathered|aligned|array|cases|split|gather\*?|align\*?)\}(?:\{[^{}]*\})?"
+                       r"(.*?)\\end\{\1\}", re.S)
+_TEXT = re.compile(r"\\(?:text|mathrm|textrm)\s*\{([^{}]*)\}")
+_DELIM = re.compile(r"\\(?:left|right)\s*(?:\\[{}]|[\[\]()|.])")
+
+
+def _unwrap_rows(latex: str) -> str | None:
+    """Handwritten lines that the VLM set as one multi-row environment (`\\begin{gathered} \\text{…} \\\\ …`)
+    → one text line per row, leftover symbols as inline $…$. Layout would treat the environment as one tall
+    formula and squeeze the whole block onto a single line. Real formulas (little \\text) stay as they are."""
+    from .math_omml import display_text
+    env = _ROWS_ENV.search(latex)
+    if env is None:
+        return None
+    if _alnum(" ".join(_TEXT.findall(latex))) < PROSE_SHARE * _alnum(display_text(latex)):
+        return None
+
+    def as_text(piece: str) -> str:
+        out = []
+        for i, part in enumerate(_TEXT.split(_DELIM.sub("", piece).replace("&", " "))):
+            part = part.strip()
+            if part:
+                out.append(part if i % 2 else f"${part}$")
+        return " ".join(out)
+
+    lines = [as_text(row) for row in re.split(r"\\\\", env.group(2)) if row.strip()]
+    if not lines:
+        return None
+    before, after = as_text(latex[:env.start()]), as_text(latex[env.end():])
+    lines[0] = f"{before} {lines[0]}".strip()
+    lines[-1] = f"{lines[-1]} {after}".strip()
+    return "\n".join(lines)
 
 
 def _spans(text: str) -> list[dict]:
@@ -347,7 +382,11 @@ def _spans(text: str) -> list[dict]:
 
     for i, part in enumerate(re.split(r"\$\$?(.+?)\$\$?", text, flags=re.S)):
         if i % 2:
-            add("equation_inline", part.strip())
+            rows = _unwrap_rows(part)
+            if rows is not None:
+                out.extend(_spans(rows))
+            else:
+                add("equation_inline", part.strip())
             continue
         pos = 0
         for m in _BARE_SCRIPT.finditer(part):

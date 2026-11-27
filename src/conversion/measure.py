@@ -128,8 +128,69 @@ def _runs(flags) -> list[list[int]]:
     return runs
 
 
+SLANT_MIN_DEG = 1.0          # handwriting drifting up / down across a long line, or a curled sheet
+SLANT_GAIN = 1.15            # the slanted grouping must separate lines clearly better than level
+
+
+def line_slope(mask: np.ndarray) -> float:
+    """Slope (dy/dx) of the text lines in a block: the shear that makes letter centres fall into the sharpest
+    rows. 0 for level text, so print is unchanged."""
+    n, _l, stats, _c = cv2.connectedComponentsWithStats(mask, connectivity=8)
+    comps = stats[1:][stats[1:, 4] >= 3]
+    if len(comps) < 20:
+        return 0.0
+    letter_h = float(np.percentile(comps[:, 3], 75))
+    comps = comps[(comps[:, 3] >= 0.45 * letter_h) & (comps[:, 3] <= 4 * letter_h)]
+    if len(comps) < 20 or mask.shape[1] < 8 * letter_h:
+        return 0.0
+    cx = comps[:, 0] + comps[:, 2] / 2.0
+    cy = comps[:, 1] + comps[:, 3] / 2.0
+    bin_h = max(1.0, letter_h / 3)
+
+    def sharpness(t: float) -> float:
+        counts = np.bincount(((cy - t * cx) - (cy - t * cx).min()).astype(int) // int(bin_h))
+        return float((counts.astype(np.float64) ** 2).sum())
+
+    level = sharpness(0.0)
+    best_t, best = 0.0, level
+    for deg in np.arange(-10.0, 10.01, 0.5):
+        t = float(np.tan(np.radians(deg)))
+        s = sharpness(t)
+        if s > best:
+            best_t, best = t, s
+    if abs(np.degrees(np.arctan(best_t))) < SLANT_MIN_DEG or best < SLANT_GAIN * level:
+        return 0.0
+    return best_t
+
+
 def text_lines(mask: np.ndarray, x_off: float = 0, y_off: float = 0, ref_height: float | None = None,
-               colored: np.ndarray | None = None, has_math: bool = False) -> list[Line]:
+               colored: np.ndarray | None = None, has_math: bool = False, tall_math: bool = False,
+               slant: bool = True) -> list[Line]:
+    """Text lines of a block; slanted handwriting is sheared level first, so its lines do not overlap and
+    merge, then each line's box is mapped back to the page (it spans the slant). `slant` False: print, which
+    the page deskew already levels (a photo's perspective tilts blocks a little; shearing them made boxes
+    taller and sizes worse: mean offset 15 → 39 pt on one photographed letter)."""
+    t = 0.0 if tall_math or not slant else line_slope(_remove_rules(mask))   # a matrix row stack is no slant
+    if t == 0.0:
+        return _level_lines(mask, x_off, y_off, ref_height, colored, has_math, tall_math)
+    h, w = mask.shape
+    pad = int(np.ceil(abs(t) * w))
+    top = pad if t > 0 else 0                       # y' = y − t·x + top stays ≥ 0
+    m = np.float32([[1, 0, 0], [-t, 1, top]])
+    sheared = cv2.warpAffine(mask, m, (w, h + pad), flags=cv2.INTER_NEAREST)
+    col = None if colored is None else cv2.warpAffine(colored, m, (w, h + pad), flags=cv2.INTER_NEAREST)
+    out = []
+    for ln in _level_lines(sheared, x_off, 0, ref_height, col, has_math, tall_math):
+        lx0, lx1 = ln.x0 - x_off, ln.x1 - x_off
+        lo, hi = sorted((t * lx0, t * lx1))
+        ln.y0 = max(0.0, ln.y0 - top + lo) + y_off
+        ln.y1 = min(float(h), ln.y1 - top + hi) + y_off
+        out.append(ln)
+    return out
+
+
+def _level_lines(mask: np.ndarray, x_off: float = 0, y_off: float = 0, ref_height: float | None = None,
+                 colored: np.ndarray | None = None, has_math: bool = False, tall_math: bool = False) -> list[Line]:
     """Text lines from connected components.
 
     Letter-sized components define lines (grouped by their vertical centre); small components (diacritics,
@@ -147,6 +208,12 @@ def text_lines(mask: np.ndarray, x_off: float = 0, y_off: float = 0, ref_height:
     letter_h = float(np.percentile([c[3] for c in comps], 75))
     # a stroke far wider than any letter and thin is a rule (a short underline survives _remove_rules)
     comps = [c for c in comps if not (c[2] > 4 * letter_h and c[3] < 0.35 * letter_h)] or comps
+    if not tall_math:
+        # no letter is 4 lines tall: such a stroke is a hand-drawn rule, bracket or slash (measured: column
+        # divider 26 ×, "[" over several lines 7.6–8 × letter height), bent enough to survive _remove_rules;
+        # left in, it overlaps every line it spans and merges them into one. Blocks with a matrix (taller than
+        # 2 em; a fraction is 1.85) keep theirs: its bracket is tall too
+        comps = [c for c in comps if c[3] <= 4 * letter_h] or comps
     main = sorted((c for c in comps if c[3] >= 0.45 * letter_h), key=lambda c: c[1] + c[3] / 2)
     groups: list[list[tuple]] = []
     for c in main:
@@ -307,7 +374,8 @@ def _ink_color(rgb: np.ndarray, mask: np.ndarray, ref: np.ndarray | None = None)
 
 def measure_block(rgb: np.ndarray, gray: np.ndarray, box_px: tuple[int, int, int, int],
                   ref_height: float | None = None, has_math: bool = False,
-                  ink_ref: np.ndarray | None = None, pen_page: bool = False) -> BlockMeasure:
+                  ink_ref: np.ndarray | None = None, pen_page: bool = False,
+                  tall_math: bool = False) -> BlockMeasure:
     """`ref_height`: typical text line height on the page (px), used to fold stray mark groups.
     `ink_ref`: the page's print colour (`ink_reference`), so colour is judged relative to the page.
     `pen_page`: the whole page is handwritten — pen strokes at a line's ends are text, not a scribble."""
@@ -319,7 +387,14 @@ def measure_block(rgb: np.ndarray, gray: np.ndarray, box_px: tuple[int, int, int
     mask = ink_mask(crop)
     color, colored = _ink_color(rgb[y0:y1, x0:x1], mask, ink_ref)
     chroma = hue_offset(rgb[y0:y1, x0:x1], ink_ref)              # per-pixel colour distance from print
-    lines = text_lines(mask, x0, y0, ref_height, colored=None if pen_page else chroma, has_math=has_math)
+    # handwritten lines overlap more than print (long ascenders / descenders: 0.37 of a line measured), so
+    # the strict formula merge, meant for a printed fraction's numerator / denominator, would join them; on a
+    # pen page it is kept for matrices only
+    strict = has_math and (tall_math or not pen_page)
+    # hand-drawn dividers / brackets and slanted lines are handwriting traits; on print the old rules hold
+    # (dropping tall strokes on a photographed letter in a plastic sleeve: mean offset 1.1 → 15 pt)
+    lines = text_lines(mask, x0, y0, ref_height, colored=None if pen_page else chroma, has_math=strict,
+                       tall_math=tall_math or not pen_page, slant=pen_page)
     for line in lines:
         g = gray[int(line.y0):int(line.y1), int(line.x0):int(line.x1)]
         ink = np.sort(g[_remove_rules(ink_mask(g)).astype(bool)])

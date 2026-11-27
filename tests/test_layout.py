@@ -32,6 +32,24 @@ def test_text_lines_counts_vietnamese_lines_despite_diacritics():
     assert len(text_lines(ink_mask(gray))) == 3
 
 
+def test_text_lines_follow_long_slanted_lines():
+    text = "những dòng chữ viết tay dài trên tờ giấy bị nghiêng lên"
+    gray = _render_lines([text] * 5, size_px=36, width=1300)
+    h, w = gray.shape
+    rot = cv2.warpAffine(gray, cv2.getRotationMatrix2D((w / 2, h / 2), 4, 1.0), (w, h + 120),
+                         borderValue=255)                  # lines drift 4° across the block
+    assert len(text_lines(ink_mask(rot))) == 5
+
+
+def test_text_lines_ignore_a_bent_hand_drawn_column_divider():
+    gray = _render_lines(["dòng một của cột", "dòng hai của cột", "dòng ba của cột", "dòng bốn của cột",
+                          "dòng năm của cột"], width=900)
+    h = gray.shape[0]
+    pts = np.array([[860 + int(6 * np.sin(y / 40)), y] for y in range(10, h - 10)], np.int32)
+    cv2.polylines(gray, [pts], False, 0, 4)                    # wavy vertical pen line beside the text
+    assert len(text_lines(ink_mask(gray))) == 5
+
+
 def test_fit_single_line_recovers_size():
     text = "Trung tá, Nguyễn Văn An"
     assert abs(fit_single_line(text, text_width_pt(text, 13.0), False, False) - 13.0) < 1e-6
@@ -114,6 +132,17 @@ def test_latex_becomes_native_word_equation(tmp_path):
 
 def _para(x0, x1, y, text="x"):
     return Para(x0, x1, [[Run(text, Typo(size=12))]], [y], 14.0)
+
+
+def test_xy_cut_keeps_matrices_side_by_side_under_a_tall_formula():
+    def para(x0, x1, y0, y1):
+        return Para(x0, x1, [[]], [(y0 + y1) / 2], y1 - y0)
+    formula = para(40, 420, 116, 201)                 # its line height reaches into the next row
+    wq, wk, wv = para(44, 134, 187, 276), para(173, 261, 187, 267), para(298, 382, 181, 261)
+    node = xy_cut([formula, wq, wk, wv], 0, 595)
+    assert isinstance(node, VStack) and node.children[0] is formula
+    split = node.children[1]
+    assert isinstance(split, HSplit) and len(split.columns) == 3
 
 
 def test_xy_cut_two_column_letterhead_then_body():
